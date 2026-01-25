@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+ENV/
+
+# Environment & Credentials
+.env
+.env.local
+*.env
+.credentials/
+*.pem
+*.key
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Logs & Data
+logs/
+*.log
+data/*.db
+data/*.sqlite
+
+# OS & Build
+.DS_Store
+dist/
+build/
+*.egg-info/
