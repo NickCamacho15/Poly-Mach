@@ -10,11 +10,11 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import structlog
 
-from ..data.models import OrderIntent, OrderStatus, OrderType, Price, Side
+from ..data.models import OrderIntent, OrderStatus, OrderType, Price, PriceLevel, Side
 from ..data.orderbook import OrderBookTracker
 from ..state.state_manager import OrderState, PositionState, StateManager
 
@@ -32,6 +32,8 @@ MAKER_FILL_QUEUE_WEIGHT = 0.2
 MAKER_FILL_AGE_WEIGHT = 0.1
 MAKER_FILL_MAX_PROB = 0.35
 MAKER_FILL_MAX_AGE_SECONDS = 30.0
+MAKER_FILL_MAX_QTY_PER_TICK = 100
+MAKER_FILL_MAX_FRACTION_PER_TICK = 0.02
 
 
 # =============================================================================
@@ -126,11 +128,17 @@ class PerformanceMetrics:
     Attributes:
         initial_balance: Starting balance
         current_balance: Current cash balance
-        position_value: Total value of open positions
+        position_value: Total value of open positions (depth-aware liquidation value)
+        position_value_best_bid: Total value using best-bid mark (optimistic)
+        position_value_liquidation: Total liquidation value using order book depth (conservative)
         total_equity: Balance + position value
+        total_equity_best_bid: Balance + position value (best bid)
         total_pnl: Total profit/loss
+        total_pnl_best_bid: Total P&L using best-bid valuation
         realized_pnl: P&L from closed positions
-        unrealized_pnl: P&L from open positions
+        unrealized_pnl: Unrealized P&L using liquidation valuation
+        unrealized_pnl_best_bid: Unrealized P&L using best-bid valuation
+        unrealized_pnl_liquidation: Unrealized P&L using liquidation valuation (same as unrealized_pnl)
         total_fees: Total fees paid
         total_trades: Number of trades executed
         winning_trades: Number of profitable trades
@@ -140,10 +148,16 @@ class PerformanceMetrics:
     initial_balance: Decimal
     current_balance: Decimal
     position_value: Decimal
+    position_value_best_bid: Decimal
+    position_value_liquidation: Decimal
     total_equity: Decimal
+    total_equity_best_bid: Decimal
     total_pnl: Decimal
+    total_pnl_best_bid: Decimal
     realized_pnl: Decimal
     unrealized_pnl: Decimal
+    unrealized_pnl_best_bid: Decimal
+    unrealized_pnl_liquidation: Decimal
     total_fees: Decimal
     total_trades: int
     winning_trades: int
@@ -173,11 +187,17 @@ class PerformanceMetrics:
             "initial_balance": float(self.initial_balance),
             "current_balance": float(self.current_balance),
             "position_value": float(self.position_value),
+            "position_value_best_bid": float(self.position_value_best_bid),
+            "position_value_liquidation": float(self.position_value_liquidation),
             "total_equity": float(self.total_equity),
+            "total_equity_best_bid": float(self.total_equity_best_bid),
             "total_pnl": float(self.total_pnl),
+            "total_pnl_best_bid": float(self.total_pnl_best_bid),
             "pnl_percent": self.pnl_percent,
             "realized_pnl": float(self.realized_pnl),
             "unrealized_pnl": float(self.unrealized_pnl),
+            "unrealized_pnl_best_bid": float(self.unrealized_pnl_best_bid),
+            "unrealized_pnl_liquidation": float(self.unrealized_pnl_liquidation),
             "total_fees": float(self.total_fees),
             "total_trades": self.total_trades,
             "winning_trades": self.winning_trades,
@@ -414,15 +434,38 @@ class PaperExecutor:
                     status=OrderStatus.REJECTED,
                     error="No liquidity available",
                 )
+
+            is_buy = order.intent in (OrderIntent.BUY_LONG, OrderIntent.BUY_SHORT)
+            side = (
+                Side.YES
+                if order.intent in (OrderIntent.BUY_LONG, OrderIntent.SELL_LONG)
+                else Side.NO
+            )
+            current_position = self.state.get_position(order.market_slug)
+            is_buy_side_flip = (
+                is_buy and current_position is not None and current_position.side != side
+            )
             
             # Check if limit order is marketable
             if order.order_type == OrderType.LIMIT and order.price is not None:
                 is_marketable = self._is_marketable(order, fill_price)
                 if not is_marketable:
                     # Order rests on book
+                    if is_buy and not is_buy_side_flip:
+                        required = order.price * order.quantity
+                        if required > self.state.get_balance():
+                            raise InsufficientBalanceError(
+                                f"Insufficient balance: need ${required:.2f}, have ${self.state.get_balance():.2f}"
+                            )
                     return self._create_resting_order(order, order_id)
                 if order.post_only:
                     post_price = self._get_post_only_price(order)
+                    if is_buy and not is_buy_side_flip:
+                        required = post_price * order.quantity
+                        if required > self.state.get_balance():
+                            raise InsufficientBalanceError(
+                                f"Insufficient balance: need ${required:.2f}, have ${self.state.get_balance():.2f}"
+                            )
                     post_order = PaperOrderRequest(
                         market_slug=order.market_slug,
                         intent=order.intent,
@@ -437,8 +480,104 @@ class PaperExecutor:
                         reason="Post-only: resting instead of taking",
                     )
             
-            # Execute immediately
-            return self._execute_fill(order, order_id, fill_price, is_taker=True)
+            # Execute immediately (depth-aware when possible)
+            if is_buy and not is_buy_side_flip:
+                # Require sufficient balance for the full notional (exchange-like behavior).
+                check_price = order.price if order.price is not None else fill_price
+                required = check_price * order.quantity
+                # If we're taking (taker fill), include taker fee.
+                if order.order_type == OrderType.MARKET or (
+                    order.order_type == OrderType.LIMIT and order.price is None
+                ) or (
+                    order.order_type == OrderType.LIMIT and order.price is not None
+                ):
+                    # Market orders always take; marketable limit orders take (post_only handled above).
+                    required = required + (required * TAKER_FEE_RATE)
+                if required > self.state.get_balance():
+                    raise InsufficientBalanceError(
+                        f"Insufficient balance: need ${required:.2f}, have ${self.state.get_balance():.2f}"
+                    )
+            book = self.orderbook.get(order.market_slug)
+            if book is None:
+                # Fallback: top-of-book fill price only.
+                return self._execute_fill(order, order_id, fill_price, is_taker=True)
+
+            sort_desc = not is_buy  # buys walk asks low->high, sells walk bids high->low
+
+            levels: List[PriceLevel] = []
+            if order.intent == OrderIntent.BUY_LONG:
+                levels = list(book.yes.asks)
+            elif order.intent == OrderIntent.BUY_SHORT:
+                levels = list(book.no.asks)
+            elif order.intent == OrderIntent.SELL_LONG:
+                levels = list(book.yes.bids)
+            elif order.intent == OrderIntent.SELL_SHORT:
+                levels = list(book.no.bids)
+
+            # Apply limit-price constraints for marketable LIMIT orders.
+            if order.order_type == OrderType.LIMIT and order.price is not None:
+                if is_buy:
+                    levels = [lvl for lvl in levels if lvl.price <= order.price]
+                else:
+                    levels = [lvl for lvl in levels if lvl.price >= order.price]
+
+            filled_qty, vwap, _total, levels_used = self._walk_price_levels(
+                levels,
+                order.quantity,
+                sort_desc=sort_desc,
+            )
+
+            if filled_qty <= 0:
+                return ExecutionResult(
+                    order_id=order_id,
+                    status=OrderStatus.REJECTED,
+                    error="No liquidity available",
+                )
+
+            if filled_qty < order.quantity:
+                fill_order = PaperOrderRequest(
+                    market_slug=order.market_slug,
+                    intent=order.intent,
+                    quantity=filled_qty,
+                    price=order.price,
+                    order_type=order.order_type,
+                    post_only=order.post_only,
+                )
+                fill_result = self._execute_fill(fill_order, order_id, vwap, is_taker=True)
+
+                # Rest the remainder for LIMIT orders.
+                if order.order_type == OrderType.LIMIT and order.price is not None:
+                    order_state = OrderState(
+                        order_id=order_id,
+                        market_slug=order.market_slug,
+                        intent=order.intent,
+                        price=order.price,
+                        quantity=order.quantity,
+                        filled_quantity=filled_qty,
+                        status=OrderStatus.PARTIALLY_FILLED,
+                    )
+                    self.state.add_order(order_state)
+                    logger.info(
+                        "Order partially filled; resting remainder",
+                        order_id=order_id,
+                        market_slug=order.market_slug,
+                        filled_quantity=filled_qty,
+                        remaining_quantity=order.quantity - filled_qty,
+                        limit_price=float(order.price),
+                        levels_used=levels_used,
+                    )
+
+                return ExecutionResult(
+                    order_id=order_id,
+                    status=OrderStatus.PARTIALLY_FILLED,
+                    filled_quantity=filled_qty,
+                    avg_fill_price=vwap,
+                    fee=fill_result.fee,
+                    trade=fill_result.trade,
+                )
+
+            # Fully filled across available depth (possibly multiple levels)
+            return self._execute_fill(order, order_id, vwap, is_taker=True)
             
         except InsufficientBalanceError as e:
             logger.warning("Insufficient balance", order_id=order_id, error=str(e))
@@ -954,63 +1093,140 @@ class PaperExecutor:
         open_orders = self.state.get_open_orders()
         
         for order_state in open_orders:
+            if order_state.remaining_quantity <= 0:
+                # Defensive: clear fully-filled orders that may still be present.
+                self.state.remove_order(order_state.order_id)
+                continue
+
+            if order_state.price is None:
+                continue
+
+            book = self.orderbook.get(order_state.market_slug)
+            if book is None:
+                continue
+
             fill_price = self._get_fill_price_for_order(order_state)
             
             if fill_price is None:
                 continue
             
-            # Check if now marketable
-            if self._is_order_marketable(order_state, fill_price):
-                # Remove from open orders and execute
-                self.state.remove_order(order_state.order_id)
-                
-                paper_order = PaperOrderRequest(
-                    market_slug=order_state.market_slug,
-                    intent=order_state.intent,
-                    quantity=order_state.remaining_quantity,
-                    price=order_state.price,
-                )
-                
-                try:
-                    # Resting orders are maker fills (0% fee).
-                    result = self._execute_fill(
-                        paper_order,
-                        order_state.order_id,
-                        order_state.price,  # Fill at limit price (price improvement)
-                        is_taker=False,
-                    )
-                    results.append(result)
-                except Exception as e:
-                    logger.error(
-                        "Failed to fill resting order",
-                        order_id=order_state.order_id,
-                        error=str(e),
-                    )
+            is_crossed = self._is_order_marketable(order_state, fill_price)
+
+            # Decide whether to fill this tick.
+            should_fill = is_crossed or self._should_fill_as_maker(order_state)
+            if not should_fill:
                 continue
 
-            if self._should_fill_as_maker(order_state):
-                self.state.remove_order(order_state.order_id)
-                paper_order = PaperOrderRequest(
-                    market_slug=order_state.market_slug,
-                    intent=order_state.intent,
-                    quantity=order_state.remaining_quantity,
-                    price=order_state.price,
-                )
+            # Cap the amount we can fill per tick so the simulation isn't too optimistic.
+            max_by_fraction = max(
+                1,
+                int(order_state.remaining_quantity * MAKER_FILL_MAX_FRACTION_PER_TICK),
+            )
+            fill_qty = min(
+                order_state.remaining_quantity,
+                MAKER_FILL_MAX_QTY_PER_TICK,
+                max_by_fraction,
+            )
 
-                try:
-                    result = self._execute_fill(
-                        paper_order,
+            # Bound by observed top-of-book size (simple queue proxy).
+            top_qty: Optional[int] = None
+            if order_state.intent == OrderIntent.BUY_LONG and book.yes.bids:
+                top_qty = int(book.yes.bids[0].quantity)
+            elif order_state.intent == OrderIntent.BUY_SHORT and book.no.bids:
+                top_qty = int(book.no.bids[0].quantity)
+            elif order_state.intent == OrderIntent.SELL_LONG and book.yes.asks:
+                top_qty = int(book.yes.asks[0].quantity)
+            elif order_state.intent == OrderIntent.SELL_SHORT and book.no.asks:
+                top_qty = int(book.no.asks[0].quantity)
+
+            if top_qty is not None and top_qty > 0:
+                fill_qty = min(fill_qty, top_qty)
+
+            # Inventory-safe sells (avoid exceptions like "Cannot sell X; only Y available").
+            if not order_state.is_buy:
+                current = self.state.get_position(order_state.market_slug)
+                available = (
+                    current.quantity
+                    if current is not None and current.side == order_state.side
+                    else 0
+                )
+                if available <= 0:
+                    continue
+                fill_qty = min(fill_qty, available)
+
+            if fill_qty <= 0:
+                continue
+
+            # If crossed, bound fill by current opposite-side liquidity at/through our limit.
+            if is_crossed:
+                if order_state.intent == OrderIntent.BUY_LONG:
+                    opp_levels = book.yes.asks
+                elif order_state.intent == OrderIntent.BUY_SHORT:
+                    opp_levels = book.no.asks
+                elif order_state.intent == OrderIntent.SELL_LONG:
+                    opp_levels = book.yes.bids
+                else:
+                    opp_levels = book.no.bids
+
+                if order_state.is_buy:
+                    available_liq = sum(
+                        int(lvl.quantity)
+                        for lvl in opp_levels
+                        if lvl.price <= order_state.price
+                    )
+                else:
+                    available_liq = sum(
+                        int(lvl.quantity)
+                        for lvl in opp_levels
+                        if lvl.price >= order_state.price
+                    )
+
+                if available_liq <= 0:
+                    continue
+                fill_qty = min(fill_qty, available_liq)
+
+            if fill_qty <= 0:
+                continue
+
+            paper_order = PaperOrderRequest(
+                market_slug=order_state.market_slug,
+                intent=order_state.intent,
+                quantity=fill_qty,
+                price=order_state.price,
+            )
+
+            try:
+                # Resting orders are maker fills (0% fee) at the limit price.
+                result = self._execute_fill(
+                    paper_order,
+                    order_state.order_id,
+                    order_state.price,
+                    is_taker=False,
+                )
+                results.append(result)
+
+                new_filled = order_state.filled_quantity + fill_qty
+                if new_filled >= order_state.quantity:
+                    # Fully filled: update status and remove from the book.
+                    self.state.update_order(
                         order_state.order_id,
-                        order_state.price,
-                        is_taker=False,
+                        status=OrderStatus.FILLED,
+                        filled_quantity=order_state.quantity,
                     )
-                    results.append(result)
-                except Exception as e:
-                    logger.error(
-                        "Failed to simulate maker fill",
-                        order_id=order_state.order_id,
-                        error=str(e),
+                    self.state.remove_order(order_state.order_id)
+                else:
+                    self.state.update_order(
+                        order_state.order_id,
+                        status=OrderStatus.PARTIALLY_FILLED,
+                        filled_quantity=new_filled,
                     )
+
+            except Exception as e:
+                logger.error(
+                    "Failed to simulate maker fill",
+                    order_id=order_state.order_id,
+                    error=str(e),
+                )
         
         return results
     
@@ -1102,52 +1318,94 @@ class PaperExecutor:
         current_balance = self.state.get_balance()
         positions = self.state.get_all_positions()
         
-        # Calculate position value and unrealized P&L
-        position_value = Decimal("0")
-        unrealized_pnl = Decimal("0")
+        # Calculate position value and unrealized P&L using two marking modes:
+        # - best-bid (optimistic)
+        # - depth-aware liquidation (conservative, assumes unfillable remainder is worth 0)
+        position_value_best_bid = Decimal("0")
+        unrealized_pnl_best_bid = Decimal("0")
+        position_value_liquidation = Decimal("0")
+        unrealized_pnl_liquidation = Decimal("0")
         
         for position in positions:
+            entry_value = position.avg_price * position.quantity
             book = self.orderbook.get(position.market_slug)
             
-            if book:
-                # Mark to market using bid price
+            # ----------------------------
+            # Best-bid mark
+            # ----------------------------
+            if book is not None:
                 if position.side == Side.YES:
-                    mark_price = book.yes_best_bid or position.avg_price
+                    best_bid = book.yes_best_bid
                 else:
-                    mark_price = book.no_best_bid or position.avg_price
+                    best_bid = book.no_best_bid
             else:
-                # Fallback to state manager
                 market = self.state.get_market(position.market_slug)
-                if market:
-                    if position.side == Side.YES:
-                        mark_price = market.yes_bid or position.avg_price
-                    else:
-                        mark_price = market.no_bid or position.avg_price
+                if market is not None:
+                    best_bid = market.yes_bid if position.side == Side.YES else market.no_bid
                 else:
-                    mark_price = position.avg_price
-            
-            current_value = mark_price * position.quantity
-            position_value += current_value
-            
-            # Unrealized P&L
-            entry_value = position.avg_price * position.quantity
-            pnl = current_value - entry_value
-            unrealized_pnl += pnl
+                    best_bid = None
+
+            mark_best_bid = best_bid or position.avg_price
+            value_best_bid = mark_best_bid * position.quantity
+            position_value_best_bid += value_best_bid
+            unrealized_pnl_best_bid += value_best_bid - entry_value
+
+            # ----------------------------
+            # Depth-aware liquidation mark
+            # ----------------------------
+            bid_levels: List[PriceLevel] = []
+            if book is not None:
+                side_book = book.yes if position.side == Side.YES else book.no
+                bid_levels = list(side_book.bids)
+            else:
+                # Best-effort fallback for YES side only (state has bid size for YES).
+                market = self.state.get_market(position.market_slug)
+                if (
+                    market is not None
+                    and position.side == Side.YES
+                    and market.yes_bid is not None
+                    and market.yes_bid_size > 0
+                ):
+                    bid_levels = [
+                        PriceLevel(price=market.yes_bid, quantity=int(market.yes_bid_size))
+                    ]
+
+            _filled, _vwap, liquidation_value, _levels_used = self._walk_price_levels(
+                bid_levels,
+                position.quantity,
+                sort_desc=True,
+            )
+            position_value_liquidation += liquidation_value
+            unrealized_pnl_liquidation += liquidation_value - entry_value
         
         # Realized P&L should persist even after positions close.
         realized_pnl = self._realized_pnl_total
         
+        # By default, expose conservative liquidation-based valuation in the legacy
+        # fields (position_value/unrealized_pnl/total_equity/total_pnl).
+        position_value = position_value_liquidation
+        unrealized_pnl = unrealized_pnl_liquidation
+
         total_equity = current_balance + position_value
         total_pnl = total_equity - self._initial_balance
+
+        total_equity_best_bid = current_balance + position_value_best_bid
+        total_pnl_best_bid = total_equity_best_bid - self._initial_balance
         
         return PerformanceMetrics(
             initial_balance=self._initial_balance,
             current_balance=current_balance,
             position_value=position_value,
+            position_value_best_bid=position_value_best_bid,
+            position_value_liquidation=position_value_liquidation,
             total_equity=total_equity,
+            total_equity_best_bid=total_equity_best_bid,
             total_pnl=total_pnl,
+            total_pnl_best_bid=total_pnl_best_bid,
             realized_pnl=realized_pnl,
             unrealized_pnl=unrealized_pnl,
+            unrealized_pnl_best_bid=unrealized_pnl_best_bid,
+            unrealized_pnl_liquidation=unrealized_pnl_liquidation,
             total_fees=self._total_fees,
             total_trades=len(self._trades),
             winning_trades=self._winning_trades,
@@ -1156,6 +1414,136 @@ class PaperExecutor:
             maker_fills=self._maker_fills,
             taker_fills=self._taker_fills,
         )
+
+    def _walk_price_levels(
+        self,
+        levels: List[PriceLevel],
+        quantity: int,
+        *,
+        sort_desc: bool,
+    ) -> Tuple[int, Decimal, Decimal, int]:
+        """
+        Walk order book levels to simulate an immediate fill.
+
+        Returns:
+            filled_qty, vwap_price (0 if none), total_value, levels_used
+        """
+        if quantity <= 0:
+            return 0, Decimal("0"), Decimal("0"), 0
+
+        sorted_levels = sorted(levels, key=lambda l: l.price, reverse=sort_desc)
+
+        remaining = int(quantity)
+        filled = 0
+        total = Decimal("0")
+        levels_used = 0
+
+        for level in sorted_levels:
+            if remaining <= 0:
+                break
+
+            level_qty = int(level.quantity)
+            if level_qty <= 0:
+                continue
+
+            take = min(remaining, level_qty)
+            total += level.price * take
+            filled += take
+            remaining -= take
+            levels_used += 1
+
+        vwap = (total / filled) if filled > 0 else Decimal("0")
+        return filled, vwap, total, levels_used
+
+    def get_positions_report(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """
+        Return a detailed view of open positions with best-bid marks and
+        depth-aware liquidation estimates.
+        """
+        positions = self.state.get_all_positions()
+        report: List[Dict[str, Any]] = []
+
+        for position in positions:
+            book = self.orderbook.get(position.market_slug)
+
+            best_bid: Optional[Decimal] = None
+            best_ask: Optional[Decimal] = None
+            best_bid_size: int = 0
+            best_ask_size: int = 0
+
+            if book is not None:
+                side_book = book.yes if position.side == Side.YES else book.no
+                if side_book.bids:
+                    best_bid = side_book.bids[0].price
+                    best_bid_size = int(side_book.bids[0].quantity)
+                if side_book.asks:
+                    best_ask = side_book.asks[0].price
+                    best_ask_size = int(side_book.asks[0].quantity)
+            else:
+                market = self.state.get_market(position.market_slug)
+                if market is not None:
+                    if position.side == Side.YES:
+                        best_bid = market.yes_bid
+                        best_ask = market.yes_ask
+                        best_bid_size = int(market.yes_bid_size)
+                        best_ask_size = int(market.yes_ask_size)
+                    else:
+                        best_bid = market.no_bid
+                        best_ask = market.no_ask
+
+            mark_best_bid = best_bid or position.avg_price
+            entry_value = position.avg_price * position.quantity
+            value_best_bid = mark_best_bid * position.quantity
+            unrealized_best_bid = value_best_bid - entry_value
+
+            # Depth-aware liquidation (sell into bids).
+            bid_levels: List[PriceLevel] = []
+            if book is not None:
+                side_book = book.yes if position.side == Side.YES else book.no
+                bid_levels = list(side_book.bids)
+            else:
+                # Best-effort fallback for YES side only (state has bid size for YES).
+                if position.side == Side.YES and best_bid is not None and best_bid_size > 0:
+                    bid_levels = [PriceLevel(price=best_bid, quantity=best_bid_size)]
+
+            filled_qty, vwap, liquidation_value, levels_used = self._walk_price_levels(
+                bid_levels,
+                position.quantity,
+                sort_desc=True,
+            )
+
+            # If the book cannot fill the whole position immediately, we assume the
+            # remainder is not liquidatable at any price right now (conservative).
+            liquidation_mark = (
+                (liquidation_value / position.quantity)
+                if position.quantity > 0
+                else Decimal("0")
+            )
+            unrealized_liquidation = liquidation_value - entry_value
+
+            report.append(
+                {
+                    "market_slug": position.market_slug,
+                    "side": position.side.value,
+                    "quantity": position.quantity,
+                    "avg_price": float(position.avg_price),
+                    "best_bid": float(best_bid) if best_bid is not None else None,
+                    "best_bid_size": best_bid_size,
+                    "best_ask": float(best_ask) if best_ask is not None else None,
+                    "best_ask_size": best_ask_size,
+                    "best_bid_mark": float(mark_best_bid),
+                    "unrealized_pnl_best_bid": float(unrealized_best_bid),
+                    "liquidation_mark": float(liquidation_mark),
+                    "liquidation_fillable_qty": int(filled_qty),
+                    "liquidation_unfilled_qty": int(position.quantity - filled_qty),
+                    "liquidation_levels_used": int(levels_used),
+                    "unrealized_pnl_liquidation": float(unrealized_liquidation),
+                }
+            )
+
+        # Sort most impactful first (best-bid mark), then cap output size.
+        report.sort(key=lambda r: abs(r.get("unrealized_pnl_best_bid", 0.0)), reverse=True)
+        return report[: max(0, int(limit))]
     
     def get_trades(self) -> List[TradeRecord]:
         """

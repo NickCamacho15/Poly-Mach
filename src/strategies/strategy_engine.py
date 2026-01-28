@@ -6,11 +6,11 @@ routes market updates, aggregates signals, and integrates with the executor.
 """
 
 import asyncio
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any, Callable, Coroutine, Dict, List, Optional
+from typing import Any, Callable, Coroutine, Deque, Dict, List, Optional
 
 import structlog
 
@@ -223,6 +223,10 @@ class StrategyEngine:
         self._execution_errors = 0
         self._signals_rejected_by_risk = 0
         self._last_portfolio_log_at: Optional[datetime] = None
+
+        # Execution error observability
+        self._execution_error_counts: Dict[str, int] = defaultdict(int)
+        self._execution_error_samples: Deque[Dict[str, Any]] = deque(maxlen=200)
         
         logger.info(
             "StrategyEngine initialized",
@@ -230,6 +234,56 @@ class StrategyEngine:
             enabled=enabled,
             risk_manager_enabled=self.risk_manager is not None,
         )
+
+    def _categorize_execution_error(self, error: Optional[str]) -> str:
+        if not error:
+            return "unknown"
+
+        text = error.lower()
+        if "no liquidity" in text:
+            return "no_liquidity"
+        if "insufficient balance" in text:
+            return "insufficient_balance"
+        if "market not found" in text:
+            return "market_not_found"
+        if (
+            "invalid order" in text
+            or "cannot sell" in text
+            or "quantity must be positive" in text
+            or "price must be between" in text
+        ):
+            return "invalid_order"
+        if "execution error" in text:
+            return "unexpected_exception"
+
+        return "other"
+
+    def _record_execution_error(
+        self,
+        *,
+        signal: Signal,
+        intent: Optional[OrderIntent] = None,
+        status: Optional[str] = None,
+        error: Optional[str] = None,
+    ) -> None:
+        category = self._categorize_execution_error(error)
+        self._execution_error_counts[category] += 1
+
+        sample: Dict[str, Any] = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "error_category": category,
+            "error": error,
+            "status": status,
+            "market_slug": signal.market_slug,
+            "action": getattr(signal.action, "value", str(signal.action)),
+            "strategy": signal.strategy_name,
+            "price": float(signal.price) if signal.price is not None else None,
+            "quantity": signal.quantity,
+            "intent": intent.value if intent is not None else None,
+        }
+
+        # Keep only the most recent N.
+        self._execution_error_samples.append(sample)
 
     def _mark_position_updated(self, market_slug: str) -> None:
         """
@@ -560,6 +614,13 @@ class StrategyEngine:
                     else:
                         results["errors"] += 1
                         self._execution_errors += 1
+
+                        self._record_execution_error(
+                            signal=signal,
+                            intent=order.intent,
+                            status=getattr(result.status, "value", str(result.status)),
+                            error=result.error,
+                        )
                         
                         logger.warning(
                             "Signal execution failed",
@@ -587,6 +648,13 @@ class StrategyEngine:
             except Exception as e:
                 results["errors"] += 1
                 self._execution_errors += 1
+
+                self._record_execution_error(
+                    signal=signal,
+                    intent=None,
+                    status=None,
+                    error=str(e),
+                )
                 
                 logger.error(
                     "Signal execution error",
@@ -893,6 +961,8 @@ class StrategyEngine:
             "signals_executed": self._signals_executed,
             "signals_rejected_by_risk": self._signals_rejected_by_risk,
             "execution_errors": self._execution_errors,
+            "execution_error_counts": dict(self._execution_error_counts),
+            "execution_error_samples": list(self._execution_error_samples),
             "running": self._running,
             "enabled": self._enabled,
         }

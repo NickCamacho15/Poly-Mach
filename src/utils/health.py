@@ -32,6 +32,7 @@ async def _health_handler(request: web.Request) -> web.Response:
         data["engine"] = engine.get_metrics()
     if executor is not None:
         data["paper_performance"] = executor.get_performance().to_dict()
+        data["positions"] = executor.get_positions_report()
 
     return web.json_response(data)
 
