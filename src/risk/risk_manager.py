@@ -42,10 +42,12 @@ class RiskConfig:
     max_portfolio_exposure: Decimal = Decimal("250.00")
     max_correlated_exposure: Decimal = Decimal("125.00")
     max_positions: int = 10
+    max_portfolio_exposure_pct: Decimal = Decimal("0.35")
 
     # Circuit breakers
     max_daily_loss: Decimal = Decimal("25.00")
     max_drawdown_pct: Decimal = Decimal("0.15")
+    max_total_pnl_drawdown_pct_for_new_buys: Decimal = Decimal("0.05")
 
     # Minimums
     min_trade_size: Decimal = Decimal("1.00")
@@ -108,14 +110,17 @@ class RiskManager:
         )
 
         # Initialize breaker with current equity.
-        self.circuit_breaker.initialize(self._current_equity())
+        self._starting_equity = self._current_equity()
+        self.circuit_breaker.initialize(self._starting_equity)
 
         logger.info(
             "RiskManager initialized",
             max_position_per_market=float(config.max_position_per_market),
             max_portfolio_exposure=float(config.max_portfolio_exposure),
+            max_portfolio_exposure_pct=float(config.max_portfolio_exposure_pct),
             max_daily_loss=float(config.max_daily_loss),
             kelly_fraction=float(config.kelly_fraction),
+            starting_equity=float(self._starting_equity),
         )
 
     # -------------------------------------------------------------------------
@@ -151,6 +156,8 @@ class RiskManager:
 
         can_trade, reason = self.circuit_breaker.can_trade()
         if not can_trade:
+            if signal.is_sell:
+                return RiskDecision(True, signal, "Approved: circuit breaker allows exits")
             return RiskDecision(False, None, f"Circuit breaker: {reason}")
 
         # Base sizing starts from the strategy's requested quantity.
@@ -190,16 +197,40 @@ class RiskManager:
 
         # Enforce exposure limits for BUY signals (SELL reduces exposure).
         if signal.is_buy:
+            if self._is_new_buy_blocked_by_drawdown():
+                return RiskDecision(
+                    False,
+                    None,
+                    "Rejected: portfolio drawdown blocks new buys",
+                )
+
             check = self.exposure_monitor.can_add_exposure(
                 state=self.state,
                 market_slug=signal.market_slug,
                 additional_exposure=notional,
             )
 
-            if not check.allowed:
+            current_total_exposure = self.exposure_monitor.total_exposure(self.state)
+            max_additional_pct = Decimal("0")
+            if self.config.max_portfolio_exposure_pct > 0:
+                max_by_pct = (self._current_equity() * self.config.max_portfolio_exposure_pct)
+                max_additional_pct = max_by_pct - current_total_exposure
+                if max_additional_pct < 0:
+                    max_additional_pct = Decimal("0")
+
+            max_additional = check.max_additional_exposure
+            limit_reason = check.reason if not check.allowed else "Exposure limits reached"
+            if self.config.max_portfolio_exposure_pct > 0 and max_additional_pct < max_additional:
+                max_additional = max_additional_pct
+                limit_reason = "Portfolio exposure percent limit reached"
+
+            if not check.allowed and max_additional <= 0:
+                return RiskDecision(False, None, f"Rejected: {check.reason}")
+
+            if notional > max_additional:
                 # If we can reduce size, do so.
-                if check.max_additional_exposure >= self.config.min_trade_size:
-                    reduced_qty = int(check.max_additional_exposure / price)
+                if max_additional >= self.config.min_trade_size:
+                    reduced_qty = int(max_additional / price)
                     if reduced_qty <= 0:
                         return RiskDecision(False, None, "Rejected: exposure limits")
                     qty = min(qty, reduced_qty)
@@ -207,10 +238,10 @@ class RiskManager:
                     sizing_info = {
                         **(sizing_info or {}),
                         "reduced_for_exposure": True,
-                        "max_additional_exposure": float(check.max_additional_exposure),
+                        "max_additional_exposure": float(max_additional),
                     }
                 else:
-                    return RiskDecision(False, None, f"Rejected: {check.reason}")
+                    return RiskDecision(False, None, f"Rejected: {limit_reason}")
 
             # Re-check min trade size after reduction.
             if notional < self.config.min_trade_size:
@@ -258,4 +289,13 @@ class RiskManager:
             return None
 
         return prob
+
+    def _is_new_buy_blocked_by_drawdown(self) -> bool:
+        if self.config.max_total_pnl_drawdown_pct_for_new_buys <= 0:
+            return False
+        if self._starting_equity <= 0:
+            return False
+        current_equity = self._current_equity()
+        drawdown_pct = (self._starting_equity - current_equity) / self._starting_equity
+        return drawdown_pct >= self.config.max_total_pnl_drawdown_pct_for_new_buys
 

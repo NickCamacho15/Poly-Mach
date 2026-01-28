@@ -204,12 +204,25 @@ class StrategyEngine:
         self._aggregator = SignalAggregator()
         self._running = False
         self._task: Optional[asyncio.Task] = None
+
+        # Position update plumbing: PaperExecutor fills update StateManager, but
+        # strategies cache positions internally. We subscribe to fill events and
+        # flush position updates through process_position_update().
+        self._pending_position_updates: set[str] = set()
+        self._flushing_position_updates = False
+        self._max_position_update_flush_loops = 50
+        if hasattr(self.executor, "add_fill_listener"):
+            try:
+                self.executor.add_fill_listener(self._mark_position_updated)
+            except Exception as exc:
+                logger.warning("Failed to register fill listener", error=str(exc))
         
         # Metrics
         self._signals_generated = 0
         self._signals_executed = 0
         self._execution_errors = 0
         self._signals_rejected_by_risk = 0
+        self._last_portfolio_log_at: Optional[datetime] = None
         
         logger.info(
             "StrategyEngine initialized",
@@ -217,6 +230,68 @@ class StrategyEngine:
             enabled=enabled,
             risk_manager_enabled=self.risk_manager is not None,
         )
+
+    def _mark_position_updated(self, market_slug: str) -> None:
+        """
+        Callback invoked by the executor when a fill occurs.
+
+        We buffer market slugs and flush them in a controlled loop to avoid
+        deep recursion when position-update signals themselves cause fills.
+        """
+        if market_slug:
+            self._pending_position_updates.add(market_slug)
+
+    def _flush_position_updates(self) -> None:
+        """
+        Flush any pending position updates into strategies.
+
+        - If a position exists: call process_position_update() and execute any
+          resulting signals (e.g., stop-loss / inventory reduction).
+        - If no position exists: clear cached position state for that market.
+        """
+        if self._flushing_position_updates:
+            return
+
+        if not self._pending_position_updates:
+            return
+
+        self._flushing_position_updates = True
+        try:
+            loops = 0
+            while self._pending_position_updates:
+                loops += 1
+                if loops > self._max_position_update_flush_loops:
+                    logger.error(
+                        "Position update flush exceeded max loops; clearing pending",
+                        pending_count=len(self._pending_position_updates),
+                    )
+                    self._pending_position_updates.clear()
+                    break
+
+                slugs = list(self._pending_position_updates)
+                self._pending_position_updates.clear()
+
+                for market_slug in slugs:
+                    position = self.state_manager.get_position(market_slug)
+                    if position is not None:
+                        signals = self.process_position_update(position)
+                        if signals:
+                            self.execute_signals(signals)
+                    else:
+                        for strategy in self._strategies:
+                            try:
+                                # Clear stale cached inventory when positions close.
+                                if hasattr(strategy, "clear_position_state"):
+                                    strategy.clear_position_state(market_slug)  # type: ignore[attr-defined]
+                            except Exception as exc:
+                                logger.error(
+                                    "Strategy error clearing position state",
+                                    strategy=strategy.name,
+                                    market_slug=market_slug,
+                                    error=str(exc),
+                                )
+        finally:
+            self._flushing_position_updates = False
     
     # =========================================================================
     # Strategy Management
@@ -441,6 +516,8 @@ class StrategyEngine:
                             "reason": decision.reason,
                             "metadata": decision.metadata,
                         })
+                        if signal.metadata and signal.metadata.get("risk_exit"):
+                            self._log_risk_exit_rejected(signal, decision.reason)
                         continue
 
                     # Use potentially resized signal.
@@ -490,6 +567,9 @@ class StrategyEngine:
                             error=result.error,
                         )
                     
+                    if signal.metadata and signal.metadata.get("risk_exit"):
+                        self._log_risk_exit_execution(signal, result)
+                    
                     results["details"].append({
                         "signal": signal.to_dict(),
                         "result": result.to_dict(),
@@ -498,6 +578,11 @@ class StrategyEngine:
                     # Update risk manager after execution attempt.
                     if self.risk_manager is not None:
                         self.risk_manager.on_state_update()
+
+                    # If the order filled, the executor will have notified us via
+                    # _mark_position_updated(). Flush here so strategies can react
+                    # immediately (inventory/stop-loss logic).
+                    self._flush_position_updates()
                     
             except Exception as e:
                 results["errors"] += 1
@@ -515,6 +600,34 @@ class StrategyEngine:
                 })
         
         return results
+
+    def _log_risk_exit_execution(self, signal: Signal, result) -> None:
+        market = self.state_manager.get_market(signal.market_slug)
+        payload = {
+            "exit_type": signal.metadata.get("risk_exit") if signal.metadata else None,
+            "status": result.status.value if hasattr(result, "status") else None,
+            "error": result.error,
+            "yes_bid": float(market.yes_bid) if market and market.yes_bid else None,
+            "yes_ask": float(market.yes_ask) if market and market.yes_ask else None,
+            "no_bid": float(market.no_bid) if market and market.no_bid else None,
+            "no_ask": float(market.no_ask) if market and market.no_ask else None,
+        }
+        if result.is_success:
+            logger.info("Risk exit executed", signal=signal.to_dict(), **payload)
+        else:
+            logger.warning("Risk exit failed", signal=signal.to_dict(), **payload)
+
+    def _log_risk_exit_rejected(self, signal: Signal, reason: str) -> None:
+        market = self.state_manager.get_market(signal.market_slug)
+        logger.warning(
+            "Risk exit rejected",
+            signal=signal.to_dict(),
+            reason=reason,
+            yes_bid=float(market.yes_bid) if market and market.yes_bid else None,
+            yes_ask=float(market.yes_ask) if market and market.yes_ask else None,
+            no_bid=float(market.no_bid) if market and market.no_bid else None,
+            no_ask=float(market.no_ask) if market and market.no_ask else None,
+        )
     
     def _signal_to_order(self, signal: Signal) -> PaperOrderRequest:
         """
@@ -543,6 +656,7 @@ class StrategyEngine:
             intent=intent,
             quantity=signal.quantity,
             price=signal.price,
+            post_only=bool(signal.metadata.get("post_only")) if signal.metadata else False,
         )
     
     # =========================================================================
@@ -599,6 +713,9 @@ class StrategyEngine:
         if self.risk_manager is not None:
             self.risk_manager.on_state_update()
 
+        # Periodic portfolio snapshot logging every 5 seconds.
+        self._log_portfolio_snapshot()
+
         # Process tick for all strategies
         signals = self.process_tick()
         
@@ -613,6 +730,88 @@ class StrategyEngine:
                 "Resting orders filled",
                 count=len(filled_orders),
             )
+
+        # Resting fills update StateManager via PaperExecutor; flush into strategies.
+        self._flush_position_updates()
+
+    def _log_portfolio_snapshot(self) -> None:
+        now = datetime.now(timezone.utc)
+        if self._last_portfolio_log_at is not None:
+            elapsed = (now - self._last_portfolio_log_at).total_seconds()
+            if elapsed < 5.0:
+                return
+        self._last_portfolio_log_at = now
+
+        total_equity = self.state_manager.get_total_equity()
+        cash = self.state_manager.get_balance()
+        position_value = self.state_manager.get_total_position_value()
+        positions_exposure = self.state_manager.get_exposure()
+
+        open_orders = self.state_manager.get_open_orders()
+        open_orders_exposure = Decimal("0")
+        for order in open_orders:
+            if order.remaining_quantity <= 0:
+                continue
+            open_orders_exposure += order.price * order.remaining_quantity
+
+        total_exposure = positions_exposure + open_orders_exposure
+        exposure_pct = (
+            float((total_exposure / total_equity) * 100)
+            if total_equity > 0
+            else 0.0
+        )
+
+        positions_snapshot = []
+        for position in self.state_manager.get_all_positions():
+            mark_price = self._get_mark_price(position)
+            unrealized_pnl = (mark_price - position.avg_price) * position.quantity
+            pnl_pct = (
+                float((mark_price - position.avg_price) / position.avg_price)
+                if position.avg_price > 0
+                else 0.0
+            )
+            age_seconds = (now - position.created_at).total_seconds()
+
+            positions_snapshot.append(
+                {
+                    "market": position.market_slug,
+                    "side": position.side.value,
+                    "quantity": position.quantity,
+                    "avg_price": float(position.avg_price),
+                    "mark_price": float(mark_price),
+                    "unrealized_pnl": float(unrealized_pnl),
+                    "unrealized_pnl_pct": pnl_pct,
+                    "age_seconds": age_seconds,
+                }
+            )
+
+        logger.info(
+            "Portfolio snapshot",
+            cash=float(cash),
+            position_value=float(position_value),
+            total_equity=float(total_equity),
+            positions_exposure=float(positions_exposure),
+            open_orders_exposure=float(open_orders_exposure),
+            total_exposure=float(total_exposure),
+            exposure_pct=round(exposure_pct, 2),
+            open_positions=len(positions_snapshot),
+            positions=positions_snapshot,
+        )
+
+    def _get_mark_price(self, position: PositionState) -> Decimal:
+        book = self.orderbook.get(position.market_slug)
+        if book is not None:
+            if position.side.value == "YES":
+                return book.yes_best_bid or position.avg_price
+            return book.no_best_bid or position.avg_price
+
+        market = self.state_manager.get_market(position.market_slug)
+        if market is not None:
+            if position.side.value == "YES":
+                return market.yes_bid or position.avg_price
+            return market.no_bid or position.avg_price
+
+        return position.avg_price
     
     def stop(self) -> None:
         """Stop the strategy engine."""

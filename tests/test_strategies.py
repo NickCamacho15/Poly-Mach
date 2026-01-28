@@ -1431,3 +1431,75 @@ class TestStrategyIntegration:
         # Should have inventory reduction signal
         high_urgency = [s for s in signals if s.urgency == Urgency.HIGH]
         assert len(high_urgency) > 0
+
+    def test_strategy_position_cache_updates_after_fill(
+        self,
+        strategy_engine,
+        market_maker_strategy,
+        market_with_book,
+    ):
+        """
+        CRITICAL: After an execution fill, StrategyEngine must propagate the
+        updated position into each strategy's cached state.
+        """
+        strategy_engine.add_strategy(market_maker_strategy)
+        assert market_maker_strategy.get_position(market_with_book) is None
+
+        # Force an immediate taker fill (post_only=False by default).
+        buy_signal = Signal(
+            market_slug=market_with_book,
+            action=SignalAction.BUY_YES,
+            price=Decimal("0.49"),  # >= best ask => marketable
+            quantity=10,
+            urgency=Urgency.HIGH,
+            strategy_name="test",
+            confidence=1.0,
+            reason="Test buy fill",
+        )
+        strategy_engine.execute_signals([buy_signal])
+
+        cached = market_maker_strategy.get_position(market_with_book)
+        assert cached is not None
+        assert cached.side == Side.YES
+        assert cached.quantity == 10
+
+    def test_strategy_position_cache_clears_on_close(
+        self,
+        strategy_engine,
+        market_maker_strategy,
+        market_with_book,
+    ):
+        """
+        CRITICAL: When a position is fully closed, StrategyEngine must clear
+        any stale cached position state in strategies.
+        """
+        strategy_engine.add_strategy(market_maker_strategy)
+
+        buy_signal = Signal(
+            market_slug=market_with_book,
+            action=SignalAction.BUY_YES,
+            price=Decimal("0.49"),
+            quantity=10,
+            urgency=Urgency.HIGH,
+            strategy_name="test",
+            confidence=1.0,
+            reason="Open position",
+        )
+        strategy_engine.execute_signals([buy_signal])
+        assert market_maker_strategy.get_position(market_with_book) is not None
+
+        # Close the entire position with an immediate fill (sell price <= best bid).
+        sell_signal = Signal(
+            market_slug=market_with_book,
+            action=SignalAction.SELL_YES,
+            price=Decimal("0.47"),
+            quantity=10,
+            urgency=Urgency.HIGH,
+            strategy_name="test",
+            confidence=1.0,
+            reason="Close position",
+        )
+        strategy_engine.execute_signals([sell_signal])
+
+        assert strategy_engine.state_manager.get_position(market_with_book) is None
+        assert market_maker_strategy.get_position(market_with_book) is None

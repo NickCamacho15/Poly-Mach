@@ -5,11 +5,12 @@ This module simulates order execution for paper trading mode,
 providing realistic fill simulation, fee calculation, and position management.
 """
 
+import random
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import structlog
 
@@ -26,6 +27,11 @@ logger = structlog.get_logger()
 
 TAKER_FEE_RATE = Decimal("0.001")  # 0.1% taker fee
 MAKER_FEE_RATE = Decimal("0")  # 0% maker fee (simplified)
+MAKER_FILL_BASE_PROB = 0.02
+MAKER_FILL_QUEUE_WEIGHT = 0.2
+MAKER_FILL_AGE_WEIGHT = 0.1
+MAKER_FILL_MAX_PROB = 0.35
+MAKER_FILL_MAX_AGE_SECONDS = 30.0
 
 
 # =============================================================================
@@ -143,6 +149,8 @@ class PerformanceMetrics:
     winning_trades: int
     losing_trades: int
     open_positions: int
+    maker_fills: int = 0
+    taker_fills: int = 0
     
     @property
     def win_rate(self) -> Optional[float]:
@@ -176,6 +184,8 @@ class PerformanceMetrics:
             "losing_trades": self.losing_trades,
             "win_rate": self.win_rate,
             "open_positions": self.open_positions,
+            "maker_fills": self.maker_fills,
+            "taker_fills": self.taker_fills,
         }
 
 
@@ -219,6 +229,7 @@ class PaperOrderRequest:
     quantity: int
     price: Optional[Decimal] = None
     order_type: OrderType = OrderType.LIMIT
+    post_only: bool = False
     
     @classmethod
     def from_order_request(cls, order) -> "PaperOrderRequest":
@@ -240,12 +251,17 @@ class PaperOrderRequest:
         if isinstance(order_type, str):
             order_type = OrderType(order_type)
         
+        post_only = False
+        if hasattr(order, "post_only"):
+            post_only = bool(getattr(order, "post_only"))
+
         return cls(
             market_slug=order.market_slug,
             intent=intent,
             quantity=order.quantity,
             price=price,
             order_type=order_type,
+            post_only=post_only,
         )
 
 
@@ -308,11 +324,56 @@ class PaperExecutor:
         self._total_fees = Decimal("0")
         self._winning_trades = 0
         self._losing_trades = 0
+        self._realized_pnl_total = Decimal("0")
+        self._taker_fills = 0
+        self._maker_fills = 0
+
+        # Fill listeners (used to notify StrategyEngine about position changes).
+        # Signature: listener(market_slug) -> None
+        self._fill_listeners: List[Callable[[str], None]] = []
         
         logger.info(
             "PaperExecutor initialized",
             initial_balance=float(self._initial_balance),
         )
+
+    # =========================================================================
+    # Fill Listeners
+    # =========================================================================
+
+    def add_fill_listener(self, listener: Callable[[str], None]) -> None:
+        """
+        Register a callback invoked after an order fill updates state.
+
+        Args:
+            listener: Callable that accepts a market_slug.
+        """
+        if listener not in self._fill_listeners:
+            self._fill_listeners.append(listener)
+
+    def remove_fill_listener(self, listener: Callable[[str], None]) -> None:
+        """Remove a previously registered fill listener."""
+        try:
+            self._fill_listeners.remove(listener)
+        except ValueError:
+            return
+
+    def _notify_fill_listeners(self, market_slug: str) -> None:
+        """
+        Notify listeners that a fill occurred for market_slug.
+
+        Listener errors are swallowed so execution cannot be disrupted.
+        """
+        for listener in list(self._fill_listeners):
+            try:
+                listener(market_slug)
+            except Exception as exc:
+                logger.warning(
+                    "Fill listener error",
+                    market_slug=market_slug,
+                    listener=getattr(listener, "__name__", str(listener)),
+                    error=str(exc),
+                )
     
     # =========================================================================
     # Order Execution
@@ -328,6 +389,7 @@ class PaperExecutor:
         Returns:
             ExecutionResult with execution status and details
         """
+        order = self._normalize_order(order)
         order_id = str(uuid.uuid4())
         
         logger.info(
@@ -355,12 +417,28 @@ class PaperExecutor:
             
             # Check if limit order is marketable
             if order.order_type == OrderType.LIMIT and order.price is not None:
-                if not self._is_marketable(order, fill_price):
+                is_marketable = self._is_marketable(order, fill_price)
+                if not is_marketable:
                     # Order rests on book
                     return self._create_resting_order(order, order_id)
+                if order.post_only:
+                    post_price = self._get_post_only_price(order)
+                    post_order = PaperOrderRequest(
+                        market_slug=order.market_slug,
+                        intent=order.intent,
+                        quantity=order.quantity,
+                        price=post_price,
+                        order_type=order.order_type,
+                        post_only=order.post_only,
+                    )
+                    return self._create_resting_order(
+                        post_order,
+                        order_id,
+                        reason="Post-only: resting instead of taking",
+                    )
             
             # Execute immediately
-            return self._execute_fill(order, order_id, fill_price)
+            return self._execute_fill(order, order_id, fill_price, is_taker=True)
             
         except InsufficientBalanceError as e:
             logger.warning("Insufficient balance", order_id=order_id, error=str(e))
@@ -392,6 +470,55 @@ class PaperExecutor:
         if order.price is not None:
             if order.price <= 0 or order.price >= 1:
                 raise InvalidOrderError("Price must be between 0 and 1 (exclusive)")
+
+    def _normalize_order(self, order: PaperOrderRequest) -> PaperOrderRequest:
+        """
+        Normalize sell orders into economically equivalent opposite-side buys
+        when no matching inventory exists.
+        """
+        if order.intent not in (OrderIntent.SELL_LONG, OrderIntent.SELL_SHORT):
+            return order
+
+        current = self.state.get_position(order.market_slug)
+
+        if order.intent == OrderIntent.SELL_LONG:
+            if current and current.side == Side.YES:
+                return order
+            return self._convert_sell_to_buy(order, OrderIntent.BUY_SHORT)
+
+        if order.intent == OrderIntent.SELL_SHORT:
+            if current and current.side == Side.NO:
+                return order
+            return self._convert_sell_to_buy(order, OrderIntent.BUY_LONG)
+
+        return order
+
+    def _convert_sell_to_buy(
+        self,
+        order: PaperOrderRequest,
+        target_intent: OrderIntent,
+    ) -> PaperOrderRequest:
+        converted_price = None
+        if order.price is not None:
+            converted_price = Decimal("1") - order.price
+
+        logger.debug(
+            "Normalized sell to opposite buy",
+            market_slug=order.market_slug,
+            original_intent=order.intent.value,
+            normalized_intent=target_intent.value,
+            original_price=float(order.price) if order.price is not None else None,
+            normalized_price=float(converted_price) if converted_price is not None else None,
+        )
+
+        return PaperOrderRequest(
+            market_slug=order.market_slug,
+            intent=target_intent,
+            quantity=order.quantity,
+            price=converted_price,
+            order_type=order.order_type,
+            post_only=order.post_only,
+        )
     
     def _get_fill_price(self, order: PaperOrderRequest) -> Optional[Decimal]:
         """
@@ -460,6 +587,8 @@ class PaperExecutor:
         self,
         order: PaperOrderRequest,
         order_id: str,
+        *,
+        reason: Optional[str] = None,
     ) -> ExecutionResult:
         """
         Create a resting limit order.
@@ -487,18 +616,56 @@ class PaperExecutor:
             order_id=order_id,
             market_slug=order.market_slug,
             price=float(order.price),
+            post_only=order.post_only,
+            reason=reason,
         )
         
         return ExecutionResult(
             order_id=order_id,
             status=OrderStatus.OPEN,
         )
+
+    def _get_post_only_price(self, order: PaperOrderRequest) -> Decimal:
+        """
+        Adjust price to avoid crossing the spread for post-only orders.
+        """
+        price = order.price
+        if price is None:
+            return price
+
+        book = self.orderbook.get(order.market_slug)
+        if book is not None:
+            if order.intent == OrderIntent.BUY_LONG and book.yes_best_bid is not None:
+                return min(price, book.yes_best_bid)
+            if order.intent == OrderIntent.BUY_SHORT and book.no_best_bid is not None:
+                return min(price, book.no_best_bid)
+            if order.intent == OrderIntent.SELL_LONG and book.yes_best_ask is not None:
+                return max(price, book.yes_best_ask)
+            if order.intent == OrderIntent.SELL_SHORT and book.no_best_ask is not None:
+                return max(price, book.no_best_ask)
+
+        market = self.state.get_market(order.market_slug)
+        if market is None:
+            return price
+
+        if order.intent == OrderIntent.BUY_LONG and market.yes_bid is not None:
+            return min(price, market.yes_bid)
+        if order.intent == OrderIntent.BUY_SHORT and market.no_bid is not None:
+            return min(price, market.no_bid)
+        if order.intent == OrderIntent.SELL_LONG and market.yes_ask is not None:
+            return max(price, market.yes_ask)
+        if order.intent == OrderIntent.SELL_SHORT and market.no_ask is not None:
+            return max(price, market.no_ask)
+
+        return price
     
     def _execute_fill(
         self,
         order: PaperOrderRequest,
         order_id: str,
         fill_price: Decimal,
+        *,
+        is_taker: bool,
     ) -> ExecutionResult:
         """
         Execute an immediate fill.
@@ -513,7 +680,8 @@ class PaperExecutor:
         """
         quantity = order.quantity
         cost = fill_price * quantity
-        fee = cost * TAKER_FEE_RATE
+        fee_rate = TAKER_FEE_RATE if is_taker else MAKER_FEE_RATE
+        fee = cost * fee_rate
         
         # Determine side
         side = Side.YES if order.intent in (
@@ -521,19 +689,24 @@ class PaperExecutor:
         ) else Side.NO
         
         is_buy = order.intent in (OrderIntent.BUY_LONG, OrderIntent.BUY_SHORT)
-        
+
+        current_position = self.state.get_position(order.market_slug)
+        is_buy_side_flip = (
+            is_buy and current_position is not None and current_position.side != side
+        )
+
         # Check and update balance
-        if is_buy:
+        if is_buy and not is_buy_side_flip:
             total_cost = cost + fee
             current_balance = self.state.get_balance()
-            
+
             if total_cost > current_balance:
                 raise InsufficientBalanceError(
                     f"Insufficient balance: need ${total_cost:.2f}, have ${current_balance:.2f}"
                 )
-            
+
             self.state.adjust_balance(-total_cost)
-        else:
+        elif not is_buy:
             # Selling: add proceeds minus fee
             proceeds = cost - fee
             self.state.adjust_balance(proceeds)
@@ -545,6 +718,7 @@ class PaperExecutor:
             quantity=quantity,
             price=fill_price,
             is_buy=is_buy,
+            fee=fee,
         )
         
         # Track fees
@@ -561,8 +735,14 @@ class PaperExecutor:
             price=fill_price,
             cost=cost,
             fee=fee,
+            is_taker=is_taker,
         )
         self._trades.append(trade)
+
+        if is_taker:
+            self._taker_fills += 1
+        else:
+            self._maker_fills += 1
         
         # Track win/loss for sells
         if not is_buy and realized_pnl is not None:
@@ -580,7 +760,11 @@ class PaperExecutor:
             price=float(fill_price),
             cost=float(cost),
             fee=float(fee),
+            is_taker=is_taker,
         )
+
+        # Notify listeners after state has been updated for this fill.
+        self._notify_fill_listeners(order.market_slug)
         
         return ExecutionResult(
             order_id=order_id,
@@ -598,6 +782,7 @@ class PaperExecutor:
         quantity: int,
         price: Decimal,
         is_buy: bool,
+        fee: Decimal = Decimal("0"),
     ) -> Optional[Decimal]:
         """
         Update position after a trade.
@@ -629,18 +814,34 @@ class PaperExecutor:
                     avg_price=new_avg,
                 )
             elif current and current.side != side:
-                # Opposite side - this would be closing and opening opposite
-                # For simplicity, close existing and open new
-                realized_pnl = (price - current.avg_price) * current.quantity
-                if current.side == Side.NO:
-                    realized_pnl = -realized_pnl  # Invert for NO side
-                
+                # Side flip on a buy is economically two trades:
+                # 1) close the existing position (a synthetic sell in current side basis)
+                # 2) open the new position (the actual buy in the new side basis)
+                #
+                # This ensures cashflows and P&L reconciliation remain consistent.
+                effective_close_price = Decimal("1") - price
+
+                # 1) Synthetic close: credit proceeds for the entire existing position.
+                close_proceeds = effective_close_price * current.quantity
+                self.state.adjust_balance(close_proceeds)
+
+                realized_pnl = (effective_close_price - current.avg_price) * current.quantity
+                self.state.close_position(market_slug)
+
+                # 2) Open new position: debit cost + fee for the new buy.
+                total_cost = (price * quantity) + fee
+                current_balance = self.state.get_balance()
+                if total_cost > current_balance:
+                    raise InsufficientBalanceError(
+                        f"Insufficient balance: need ${total_cost:.2f}, have ${current_balance:.2f}"
+                    )
+                self.state.adjust_balance(-total_cost)
+
                 self.state.update_position(
                     market_slug=market_slug,
                     side=side,
                     quantity=quantity,
                     avg_price=price,
-                    realized_pnl=realized_pnl,
                 )
             else:
                 # New position
@@ -652,36 +853,42 @@ class PaperExecutor:
                 )
         else:
             # Selling
-            if current:
-                # Calculate realized P&L
-                realized_pnl = (price - current.avg_price) * quantity
-                if current.side == Side.NO:
-                    realized_pnl = -realized_pnl  # Invert for NO side
-                
-                new_qty = current.quantity - quantity
-                
-                if new_qty <= 0:
-                    # Position fully closed
-                    self.state.close_position(market_slug)
-                else:
-                    # Partial close
-                    self.state.update_position(
-                        market_slug=market_slug,
-                        side=current.side,
-                        quantity=new_qty,
-                        avg_price=current.avg_price,
-                        realized_pnl=realized_pnl,
-                    )
+            if not current:
+                # Disallow naked sells in paper mode; otherwise we can "print cash"
+                # without modeling margin/collateral.
+                raise InvalidOrderError("Cannot sell without an open position")
+
+            if current.side != side:
+                raise InvalidOrderError(
+                    f"Cannot sell {side.value} when holding {current.side.value}"
+                )
+
+            if quantity > current.quantity:
+                raise InvalidOrderError(
+                    f"Cannot sell {quantity}; only {current.quantity} available"
+                )
+
+            # Calculate realized P&L for the closed quantity
+            realized_pnl = (price - current.avg_price) * quantity
+
+            new_qty = current.quantity - quantity
+
+            if new_qty <= 0:
+                # Position fully closed
+                self.state.close_position(market_slug)
             else:
-                # Short selling (opening short position) - not typical for binary markets
-                # but handle it anyway
+                # Partial close
                 self.state.update_position(
                     market_slug=market_slug,
-                    side=side,
-                    quantity=quantity,
-                    avg_price=price,
+                    side=current.side,
+                    quantity=new_qty,
+                    avg_price=current.avg_price,
+                    realized_pnl=realized_pnl,
                 )
         
+        if realized_pnl is not None:
+            self._realized_pnl_total += realized_pnl
+
         return realized_pnl
     
     # =========================================================================
@@ -765,15 +972,42 @@ class PaperExecutor:
                 )
                 
                 try:
+                    # Resting orders are maker fills (0% fee).
                     result = self._execute_fill(
                         paper_order,
                         order_state.order_id,
                         order_state.price,  # Fill at limit price (price improvement)
+                        is_taker=False,
                     )
                     results.append(result)
                 except Exception as e:
                     logger.error(
                         "Failed to fill resting order",
+                        order_id=order_state.order_id,
+                        error=str(e),
+                    )
+                continue
+
+            if self._should_fill_as_maker(order_state):
+                self.state.remove_order(order_state.order_id)
+                paper_order = PaperOrderRequest(
+                    market_slug=order_state.market_slug,
+                    intent=order_state.intent,
+                    quantity=order_state.remaining_quantity,
+                    price=order_state.price,
+                )
+
+                try:
+                    result = self._execute_fill(
+                        paper_order,
+                        order_state.order_id,
+                        order_state.price,
+                        is_taker=False,
+                    )
+                    results.append(result)
+                except Exception as e:
+                    logger.error(
+                        "Failed to simulate maker fill",
                         order_id=order_state.order_id,
                         error=str(e),
                     )
@@ -803,6 +1037,56 @@ class PaperExecutor:
         if order.is_buy:
             return order.price >= fill_price
         return order.price <= fill_price
+
+    def _should_fill_as_maker(self, order: OrderState) -> bool:
+        """
+        Probabilistically fill resting orders at/near top-of-book.
+        """
+        if order.price is None:
+            return False
+
+        book = self.orderbook.get(order.market_slug)
+        if not book:
+            return False
+
+        top_price = None
+        top_qty = None
+        if order.intent == OrderIntent.BUY_LONG:
+            if book.yes.bids:
+                top_price = book.yes.bids[0].price
+                top_qty = book.yes.bids[0].quantity
+        elif order.intent == OrderIntent.BUY_SHORT:
+            if book.no.bids:
+                top_price = book.no.bids[0].price
+                top_qty = book.no.bids[0].quantity
+        elif order.intent == OrderIntent.SELL_LONG:
+            if book.yes.asks:
+                top_price = book.yes.asks[0].price
+                top_qty = book.yes.asks[0].quantity
+        elif order.intent == OrderIntent.SELL_SHORT:
+            if book.no.asks:
+                top_price = book.no.asks[0].price
+                top_qty = book.no.asks[0].quantity
+
+        if top_price is None or top_qty is None:
+            return False
+
+        if order.is_buy and order.price < top_price:
+            return False
+        if not order.is_buy and order.price > top_price:
+            return False
+
+        queue_qty = top_qty if top_qty > 0 else order.remaining_quantity
+        queue_ratio = order.remaining_quantity / (order.remaining_quantity + queue_qty)
+        age_seconds = (datetime.now(timezone.utc) - order.created_at).total_seconds()
+        age_factor = min(age_seconds / MAKER_FILL_MAX_AGE_SECONDS, 1.0)
+
+        probability = MAKER_FILL_BASE_PROB
+        probability += queue_ratio * MAKER_FILL_QUEUE_WEIGHT
+        probability += age_factor * MAKER_FILL_AGE_WEIGHT
+        probability = min(probability, MAKER_FILL_MAX_PROB)
+
+        return random.random() < probability
     
     # =========================================================================
     # Performance Metrics
@@ -848,12 +1132,10 @@ class PaperExecutor:
             # Unrealized P&L
             entry_value = position.avg_price * position.quantity
             pnl = current_value - entry_value
-            if position.side == Side.NO:
-                pnl = -pnl
             unrealized_pnl += pnl
         
-        # Calculate realized P&L from positions
-        realized_pnl = sum(p.realized_pnl for p in positions)
+        # Realized P&L should persist even after positions close.
+        realized_pnl = self._realized_pnl_total
         
         total_equity = current_balance + position_value
         total_pnl = total_equity - self._initial_balance
@@ -871,6 +1153,8 @@ class PaperExecutor:
             winning_trades=self._winning_trades,
             losing_trades=self._losing_trades,
             open_positions=len(positions),
+            maker_fills=self._maker_fills,
+            taker_fills=self._taker_fills,
         )
     
     def get_trades(self) -> List[TradeRecord]:
@@ -917,6 +1201,7 @@ class PaperExecutor:
                 "price": float(t.price),
                 "cost": float(t.cost),
                 "fee": float(t.fee),
+                "is_taker": t.is_taker,
                 "timestamp": t.timestamp.isoformat(),
             }
             for t in trades
@@ -943,6 +1228,9 @@ class PaperExecutor:
         self._total_fees = Decimal("0")
         self._winning_trades = 0
         self._losing_trades = 0
+        self._realized_pnl_total = Decimal("0")
+        self._maker_fills = 0
+        self._taker_fills = 0
         
         logger.info(
             "PaperExecutor reset",

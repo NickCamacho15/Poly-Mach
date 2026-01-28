@@ -2,16 +2,357 @@
 Polymarket US Trading Bot - Entry Point
 """
 
+from __future__ import annotations
+
 import asyncio
+from dataclasses import dataclass
+from typing import List, Optional, Set
+
 import structlog
+
+from src.api.auth import PolymarketAuth
+from src.api.client import PolymarketClient
+from src.api.websocket import Endpoint, PolymarketWebSocket, SubscriptionType
+from src.config import Settings, settings
+from src.data.event_bus import EventBus
+from src.data.market_discovery import League, MarketDiscovery, MarketProduct
+from src.data.orderbook import OrderBookTracker, create_orderbook_handler
+from src.data.odds_feed import MockOddsFeed
+from src.data.sports_feed import MockSportsFeed
+from src.execution.paper_executor import PaperExecutor
+from src.risk.risk_manager import RiskConfig, RiskManager
+from src.state.state_manager import StateManager
+from src.strategies.live_arbitrage import LiveArbitrageConfig, LiveArbitrageStrategy
+from src.strategies.market_maker import MarketMakerStrategy
+from src.strategies.statistical_edge import StatisticalEdgeConfig, StatisticalEdgeStrategy
+from src.strategies.strategy_engine import StrategyEngine
+from src.utils.health import run_health_server
+from src.utils.logging import configure_logging
+from src.utils.metrics import FeedMonitor, MetricsRegistry
 
 logger = structlog.get_logger()
 
+# How often to check for new markets (seconds)
+MARKET_REFRESH_INTERVAL = 300  # 5 minutes
 
-async def main():
-    logger.info("Bot starting...")
-    # TODO: Initialize components
-    logger.info("Bot ready!")
+
+@dataclass(frozen=True)
+class AppComponents:
+    state_manager: StateManager
+    orderbook: OrderBookTracker
+    executor: PaperExecutor
+    risk_manager: RiskManager
+    engine: StrategyEngine
+    event_bus: EventBus
+    feed_monitor: FeedMonitor
+    metrics: MetricsRegistry
+
+
+def _parse_market_slugs(raw: str) -> List[str]:
+    if not raw:
+        return []
+    return [slug.strip() for slug in raw.split(",") if slug.strip()]
+
+
+def _parse_patterns(raw: str) -> List[str]:
+    if not raw:
+        return []
+    return [pattern.strip() for pattern in raw.split(",") if pattern.strip()]
+
+
+def _parse_leagues(raw: str) -> List[League]:
+    """Parse comma-separated league codes into League enums."""
+    leagues = []
+    for code in raw.split(","):
+        code = code.strip().lower()
+        if code:
+            try:
+                leagues.append(League(code))
+            except ValueError:
+                logger.warning("Unknown league code", code=code)
+    return leagues
+
+
+def _parse_products(raw: str) -> List[MarketProduct]:
+    """Parse comma-separated product codes into MarketProduct enums."""
+    products = []
+    for code in raw.split(","):
+        code = code.strip().lower()
+        if code:
+            try:
+                products.append(MarketProduct(code))
+            except ValueError:
+                logger.warning("Unknown product code", code=code)
+    return products
+
+
+async def discover_markets(
+    client: PolymarketClient,
+    leagues: List[League],
+    products: Optional[List[MarketProduct]] = None,
+) -> List[str]:
+    """
+    Auto-discover active markets from the Polymarket API.
+    
+    Args:
+        client: API client
+        leagues: Leagues to include (NBA, CBB, etc.)
+        products: Market products to include (moneyline, spread, total)
+        
+    Returns:
+        List of market slugs to trade
+    """
+    logger.info("Discovering markets", leagues=[l.value for l in leagues])
+    
+    try:
+        response = await client._request("GET", "/v1/markets", params={
+            "limit": 500,
+            "closed": "false",  # Only open markets
+        })
+        markets_data = response.get("markets", [])
+    except Exception as e:
+        logger.error("Failed to fetch markets", error=str(e))
+        return []
+    
+    discovery = MarketDiscovery()
+    markets = discovery.parse_markets(markets_data)
+    
+    # Filter by league
+    if leagues:
+        markets = discovery.filter_by_leagues(markets, leagues)
+    
+    # Filter by product type
+    if products:
+        markets = discovery.filter_by_products(markets, products)
+    
+    # Only open markets
+    markets = [m for m in markets if not m.closed]
+    
+    slugs = [m.slug for m in markets]
+    logger.info(
+        "Discovered markets",
+        total=len(slugs),
+        leagues={l.value: len([m for m in markets if m.league == l]) for l in leagues},
+    )
+    
+    return slugs
+
+
+def build_risk_config(app_settings: Settings) -> RiskConfig:
+    return RiskConfig(
+        kelly_fraction=app_settings.kelly_fraction,
+        min_edge=app_settings.min_edge,
+        max_position_per_market=app_settings.max_position_per_market,
+        max_portfolio_exposure=app_settings.max_portfolio_exposure,
+        max_portfolio_exposure_pct=app_settings.max_portfolio_exposure_pct,
+        max_correlated_exposure=app_settings.max_correlated_exposure,
+        max_positions=app_settings.max_positions,
+        max_daily_loss=app_settings.max_daily_loss,
+        max_drawdown_pct=app_settings.max_drawdown_pct,
+        max_total_pnl_drawdown_pct_for_new_buys=app_settings.max_total_pnl_drawdown_pct_for_new_buys,
+        min_trade_size=app_settings.min_trade_size,
+    )
+
+
+def build_components(app_settings: Settings) -> AppComponents:
+    state_manager = StateManager(initial_balance=app_settings.initial_balance)
+    orderbook = OrderBookTracker()
+    executor = PaperExecutor(state_manager, orderbook)
+    risk_manager = RiskManager(build_risk_config(app_settings), state_manager)
+    event_bus = EventBus()
+    feed_monitor = FeedMonitor(stale_after_seconds=app_settings.feed_stale_seconds)
+    metrics = MetricsRegistry()
+
+    engine = StrategyEngine(
+        state_manager=state_manager,
+        orderbook=orderbook,
+        executor=executor,
+        risk_manager=risk_manager,
+    )
+    engine.add_strategy(MarketMakerStrategy())
+
+    if app_settings.enable_live_arbitrage:
+        live_config = LiveArbitrageConfig(
+            min_edge=app_settings.live_arb_min_edge,
+            order_size=app_settings.live_arb_order_size,
+            cooldown_seconds=app_settings.live_arb_cooldown_seconds,
+            enabled_markets=_parse_patterns(app_settings.live_arb_markets),
+        )
+        engine.add_strategy(
+            LiveArbitrageStrategy(
+                config=live_config,
+                event_bus=event_bus,
+                metrics=metrics,
+            )
+        )
+
+    if app_settings.enable_statistical_edge:
+        edge_config = StatisticalEdgeConfig(
+            min_edge=app_settings.stat_edge_min_edge,
+            order_size=app_settings.stat_edge_order_size,
+            cooldown_seconds=app_settings.stat_edge_cooldown_seconds,
+            enabled_markets=_parse_patterns(app_settings.stat_edge_markets),
+        )
+        engine.add_strategy(
+            StatisticalEdgeStrategy(
+                config=edge_config,
+                event_bus=event_bus,
+                metrics=metrics,
+            )
+        )
+
+    return AppComponents(
+        state_manager=state_manager,
+        orderbook=orderbook,
+        executor=executor,
+        risk_manager=risk_manager,
+        engine=engine,
+        event_bus=event_bus,
+        feed_monitor=feed_monitor,
+        metrics=metrics,
+    )
+
+
+async def market_refresh_loop(
+    client: PolymarketClient,
+    ws: PolymarketWebSocket,
+    leagues: List[League],
+    products: Optional[List[MarketProduct]],
+    subscribed: Set[str],
+) -> None:
+    """
+    Periodically check for new markets and subscribe to them.
+    """
+    while True:
+        await asyncio.sleep(MARKET_REFRESH_INTERVAL)
+        
+        try:
+            current_slugs = await discover_markets(client, leagues, products)
+            new_slugs = [s for s in current_slugs if s not in subscribed]
+            
+            if new_slugs:
+                logger.info("Found new markets", count=len(new_slugs), slugs=new_slugs[:5])
+                await ws.subscribe(SubscriptionType.MARKET_DATA, new_slugs)
+                subscribed.update(new_slugs)
+        except Exception as e:
+            logger.warning("Market refresh failed", error=str(e))
+
+
+async def main() -> None:
+    configure_logging(
+        log_level=settings.log_level,
+        log_file=settings.log_file,
+        log_json=settings.log_json,
+    )
+    logger.info("Bot starting...", mode=settings.trading_mode)
+
+    components = build_components(settings)
+
+    if not settings.pm_api_key_id or not settings.pm_private_key:
+        logger.error("Missing API credentials; set PM_API_KEY_ID and PM_PRIVATE_KEY")
+        return
+
+    auth = PolymarketAuth(settings.pm_api_key_id, settings.pm_private_key)
+    
+    # Determine market slugs: manual or auto-discovery
+    market_slugs: List[str] = []
+    leagues: List[League] = []
+    products: List[MarketProduct] = []
+    
+    manual_slugs = _parse_market_slugs(settings.market_slugs)
+    
+    if manual_slugs:
+        # Use manually configured slugs
+        market_slugs = manual_slugs
+        logger.info("Using configured markets", count=len(market_slugs))
+    else:
+        # Auto-discover markets
+        leagues = _parse_leagues(settings.leagues)
+        products = _parse_products(settings.market_types)
+        
+        if not leagues:
+            leagues = [League.NBA, League.CBB]  # Default to basketball
+            
+        logger.info(
+            "Auto-discovery enabled",
+            leagues=[l.value for l in leagues],
+            products=[p.value for p in products] if products else "all",
+        )
+        
+        async with PolymarketClient(auth) as client:
+            market_slugs = await discover_markets(client, leagues, products)
+        
+        if not market_slugs:
+            logger.error("No markets found for configured leagues")
+            return
+
+    ws = PolymarketWebSocket(auth, base_url=settings.pm_ws_url)
+
+    # Wire handlers in order: state updates -> order book -> strategy engine.
+    ws.on("MARKET_DATA", components.state_manager.create_market_handler())
+    ws.on("MARKET_DATA", create_orderbook_handler(components.orderbook))
+    ws.on("MARKET_DATA", components.engine.create_market_handler())
+
+    # Track subscribed markets for refresh loop
+    subscribed: Set[str] = set(market_slugs)
+
+    async with ws:
+        await ws.connect(Endpoint.MARKETS)
+        await ws.subscribe(SubscriptionType.MARKET_DATA, market_slugs)
+
+        logger.info("Bot ready", markets=len(market_slugs), mode=settings.trading_mode)
+
+        # Build task list
+        tasks = [
+            ws.run(),
+            components.engine.run(),
+            run_health_server(
+                settings.health_host,
+                settings.health_port,
+                feed_monitor=components.feed_monitor,
+                metrics=components.metrics,
+                engine=components.engine,
+                executor=components.executor,
+            ),
+        ]
+
+        # Optional feed tasks for live strategies (mock by default)
+        if settings.enable_live_arbitrage or settings.enable_statistical_edge:
+            if settings.use_mock_feeds:
+                if settings.enable_live_arbitrage:
+                    sports_feed = MockSportsFeed(
+                        components.event_bus,
+                        market_slugs,
+                        update_interval=settings.mock_sports_interval,
+                        feed_monitor=components.feed_monitor,
+                        metrics=components.metrics,
+                    )
+                    tasks.append(sports_feed.run())
+                if settings.enable_statistical_edge:
+                    odds_feed = MockOddsFeed(
+                        components.event_bus,
+                        market_slugs,
+                        update_interval=settings.mock_odds_interval,
+                        feed_monitor=components.feed_monitor,
+                        metrics=components.metrics,
+                    )
+                    tasks.append(odds_feed.run())
+            else:
+                logger.warning(
+                    "Live strategies enabled but feeds are disabled; set USE_MOCK_FEEDS or configure provider",
+                    live_arbitrage=settings.enable_live_arbitrage,
+                    statistical_edge=settings.enable_statistical_edge,
+                )
+        
+        # Add market refresh loop if auto-discovery is enabled
+        if not manual_slugs and leagues:
+            async with PolymarketClient(auth) as client:
+                tasks.append(
+                    market_refresh_loop(client, ws, leagues, products, subscribed)
+                )
+                await asyncio.gather(*tasks)
+        else:
+            await asyncio.gather(*tasks)
 
 
 if __name__ == "__main__":

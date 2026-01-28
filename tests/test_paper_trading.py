@@ -795,6 +795,71 @@ class TestPaperExecutorPositionManagement:
         position = paper_executor.state.get_position(market_with_book)
         assert position is None
 
+    def test_side_flip_realized_pnl_uses_same_price_basis(self, paper_executor):
+        """
+        When closing via the opposite side (YES <-> NO), realized P&L must compare
+        prices in the existing position's basis. This happens in practice when
+        sells are normalized into opposite-side buys and a later trade flips sides.
+        """
+        market_slug = "test-flip-market"
+
+        # Start with a YES position.
+        paper_executor.state.update_position(
+            market_slug=market_slug,
+            side=Side.YES,
+            quantity=10,
+            avg_price=Decimal("0.30"),
+        )
+
+        # Buying the opposite side closes the YES position. The close price is
+        # expressed in NO basis, so the effective YES close price is (1 - NO_price).
+        start_balance = paper_executor.state.get_balance()
+        realized = paper_executor._update_position(
+            market_slug=market_slug,
+            side=Side.NO,
+            quantity=10,
+            price=Decimal("0.60"),
+            is_buy=True,
+            fee=Decimal("0"),
+        )
+
+        assert realized == Decimal("1.0")  # (1 - 0.60 - 0.30) * 10
+        # Cashflow: + (0.40 * 10) - (0.60 * 10) = -2.0
+        assert paper_executor.state.get_balance() == start_balance - Decimal("2.0")
+        pos = paper_executor.state.get_position(market_slug)
+        assert pos is not None
+        assert pos.side == Side.NO
+        assert pos.quantity == 10
+        assert pos.avg_price == Decimal("0.60")
+        assert paper_executor._realized_pnl_total == Decimal("1.0")
+
+    def test_side_flip_partial_close_opens_remaining_new_side(self, paper_executor):
+        """Under Option A, side flip closes existing and opens new side at order qty."""
+        market_slug = "test-flip-partial-market"
+
+        paper_executor.state.update_position(
+            market_slug=market_slug,
+            side=Side.YES,
+            quantity=10,
+            avg_price=Decimal("0.30"),
+        )
+
+        realized = paper_executor._update_position(
+            market_slug=market_slug,
+            side=Side.NO,
+            quantity=15,
+            price=Decimal("0.60"),
+            is_buy=True,
+            fee=Decimal("0"),
+        )
+
+        assert realized == Decimal("1.0")  # Close 10 YES at effective 0.40
+        pos = paper_executor.state.get_position(market_slug)
+        assert pos is not None
+        assert pos.side == Side.NO
+        assert pos.quantity == 15
+        assert pos.avg_price == Decimal("0.60")
+
 
 class TestPaperExecutorBalanceManagement:
     """Tests for balance management during execution."""
@@ -971,6 +1036,160 @@ class TestPaperExecutorPerformance:
         
         # Unrealized P&L = (0.55 - 0.49) * 100 = 6
         assert perf.unrealized_pnl == Decimal("6")
+
+    def test_performance_no_unrealized_pnl(self, paper_executor, market_with_book):
+        """Test unrealized P&L for NO positions."""
+        paper_executor.orderbook.update(market_with_book, {
+            "yes": {
+                "bids": [["0.60", "500"]],
+                "asks": [["0.62", "300"]],
+            },
+            "no": {
+                "bids": [["0.39", "400"]],
+                "asks": [["0.40", "350"]],
+            },
+        })
+
+        buy_no = PaperOrderRequest(
+            market_slug=market_with_book,
+            intent=OrderIntent.BUY_SHORT,
+            quantity=100,
+            price=Decimal("0.41"),
+        )
+        paper_executor.execute_order(buy_no)
+
+        paper_executor.orderbook.update(market_with_book, {
+            "yes": {
+                "bids": [["0.38", "500"]],
+                "asks": [["0.40", "300"]],
+            },
+            "no": {
+                "bids": [["0.60", "400"]],
+                "asks": [["0.62", "350"]],
+            },
+        })
+
+        perf = paper_executor.get_performance()
+        assert perf.unrealized_pnl == Decimal("20")
+
+    def test_performance_no_realized_pnl(self, paper_executor, market_with_book):
+        """Test realized P&L for NO positions."""
+        paper_executor.orderbook.update(market_with_book, {
+            "yes": {
+                "bids": [["0.60", "500"]],
+                "asks": [["0.62", "300"]],
+            },
+            "no": {
+                "bids": [["0.39", "400"]],
+                "asks": [["0.40", "350"]],
+            },
+        })
+
+        buy_no = PaperOrderRequest(
+            market_slug=market_with_book,
+            intent=OrderIntent.BUY_SHORT,
+            quantity=100,
+            price=Decimal("0.41"),
+        )
+        paper_executor.execute_order(buy_no)
+
+        paper_executor.orderbook.update(market_with_book, {
+            "yes": {
+                "bids": [["0.38", "500"]],
+                "asks": [["0.40", "300"]],
+            },
+            "no": {
+                "bids": [["0.60", "400"]],
+                "asks": [["0.62", "350"]],
+            },
+        })
+
+        sell_no = PaperOrderRequest(
+            market_slug=market_with_book,
+            intent=OrderIntent.SELL_SHORT,
+            quantity=100,
+            price=Decimal("0.59"),
+        )
+        paper_executor.execute_order(sell_no)
+
+        perf = paper_executor.get_performance()
+        assert perf.realized_pnl == Decimal("20")
+        assert perf.unrealized_pnl == Decimal("0")
+
+    def test_performance_pnl_reconciliation(self, paper_executor, market_with_book):
+        """Test that P&L reconciles with fees for NO positions."""
+        paper_executor.orderbook.update(market_with_book, {
+            "yes": {
+                "bids": [["0.60", "500"]],
+                "asks": [["0.62", "300"]],
+            },
+            "no": {
+                "bids": [["0.39", "400"]],
+                "asks": [["0.40", "350"]],
+            },
+        })
+
+        buy_no = PaperOrderRequest(
+            market_slug=market_with_book,
+            intent=OrderIntent.BUY_SHORT,
+            quantity=100,
+            price=Decimal("0.41"),
+        )
+        paper_executor.execute_order(buy_no)
+
+        paper_executor.orderbook.update(market_with_book, {
+            "yes": {
+                "bids": [["0.38", "500"]],
+                "asks": [["0.40", "300"]],
+            },
+            "no": {
+                "bids": [["0.60", "400"]],
+                "asks": [["0.62", "350"]],
+            },
+        })
+
+        sell_no = PaperOrderRequest(
+            market_slug=market_with_book,
+            intent=OrderIntent.SELL_SHORT,
+            quantity=100,
+            price=Decimal("0.59"),
+        )
+        paper_executor.execute_order(sell_no)
+
+        perf = paper_executor.get_performance()
+        expected_total_pnl = perf.realized_pnl + perf.unrealized_pnl - perf.total_fees
+        assert perf.total_pnl == expected_total_pnl
+
+    def test_performance_pnl_reconciliation_after_side_flip(self, paper_executor):
+        """P&L should reconcile even after a buy-side side flip (YES<->NO)."""
+        market_slug = "flip-reconcile-market"
+
+        # Set up a book where both YES and NO have liquidity.
+        paper_executor.orderbook.update(market_slug, {
+            "yes": {"bids": [["0.39", "500"]], "asks": [["0.40", "500"]]},
+            "no": {"bids": [["0.59", "500"]], "asks": [["0.60", "500"]]},
+        })
+
+        # Buy YES (fills at 0.40)
+        paper_executor.execute_order(PaperOrderRequest(
+            market_slug=market_slug,
+            intent=OrderIntent.BUY_LONG,
+            quantity=10,
+            price=Decimal("0.41"),
+        ))
+
+        # Flip by buying NO (fills at 0.60); Option A: synthetic close YES at 0.40,
+        # then open NO at 0.60.
+        paper_executor.execute_order(PaperOrderRequest(
+            market_slug=market_slug,
+            intent=OrderIntent.BUY_SHORT,
+            quantity=10,
+            price=Decimal("0.61"),
+        ))
+
+        perf = paper_executor.get_performance()
+        expected_total_pnl = perf.realized_pnl + perf.unrealized_pnl - perf.total_fees
+        assert perf.total_pnl == expected_total_pnl
     
     def test_trade_history(self, paper_executor, market_with_book):
         """Test trade history retrieval."""

@@ -316,6 +316,15 @@ class BaseStrategy(ABC):
             position: New position state
         """
         self._positions[position.market_slug] = position
+
+    def clear_position_state(self, market_slug: str) -> None:
+        """
+        Remove cached position state for a market.
+
+        This is used when a position is closed (StateManager no longer has it),
+        to avoid strategies operating on stale inventory.
+        """
+        self._positions.pop(market_slug, None)
     
     def get_market(self, market_slug: str) -> Optional[MarketState]:
         """
@@ -406,7 +415,8 @@ class BaseStrategy(ABC):
             urgency: Execution urgency
             confidence: Confidence level (0.0 to 1.0)
             reason: Explanation for the signal
-            metadata: Optional additional data
+            metadata: Optional additional data. To enable Kelly sizing, include
+                metadata={"true_probability": Decimal|str}.
             
         Returns:
             New Signal instance

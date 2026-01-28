@@ -57,6 +57,26 @@ def sample_market_data():
     }
 
 
+@pytest.fixture
+def sample_market_data_bids_offers():
+    """Sample live-style market data message with top-level bids/offers."""
+    return {
+        "type": "MARKET_DATA",
+        "marketSlug": "nba-lakers-vs-celtics-2025-01-25",
+        "timestamp": "2025-01-25T12:00:00.123Z",
+        "bids": [
+            {"px": {"value": "0.47", "currency": "USD"}, "qty": "500.000"},
+            {"px": {"value": "0.46", "currency": "USD"}, "qty": "1000.000"},
+            {"px": {"value": "0.45", "currency": "USD"}, "qty": "2000.000"},
+        ],
+        "offers": [
+            {"px": {"value": "0.49", "currency": "USD"}, "qty": "300.000"},
+            {"px": {"value": "0.50", "currency": "USD"}, "qty": "800.000"},
+            {"px": {"value": "0.51", "currency": "USD"}, "qty": "1500.000"},
+        ],
+    }
+
+
 # =============================================================================
 # WebSocket Manager Tests
 # =============================================================================
@@ -198,6 +218,36 @@ class TestPolymarketWebSocket:
         assert len(received) == 1
         assert received[0]["type"] == "MARKET_DATA"
         assert received[0]["value"] == 1
+
+    @pytest.mark.asyncio
+    async def test_message_dispatch_enveloped_market_data(self, mock_auth):
+        """Test dispatching for subscriptionType-wrapped market data."""
+        from src.api.websocket import PolymarketWebSocket
+
+        ws = PolymarketWebSocket(mock_auth)
+        received = []
+
+        async def handler(data):
+            received.append(data)
+
+        ws.on("MARKET_DATA", handler)
+
+        message = {
+            "requestId": "sub_market_data_1",
+            "subscriptionType": "SUBSCRIPTION_TYPE_MARKET_DATA",
+            "marketData": {
+                "marketSlug": "nba-lakers-vs-celtics-2025-01-25",
+                "yes": {"bids": [], "asks": []},
+                "no": {"bids": [], "asks": []},
+            },
+        }
+
+        await ws._handle_message(json.dumps(message))
+
+        assert len(received) == 1
+        assert received[0]["type"] == "MARKET_DATA"
+        assert received[0]["marketSlug"] == "nba-lakers-vs-celtics-2025-01-25"
+        assert received[0]["requestId"] == "sub_market_data_1"
     
     @pytest.mark.asyncio
     async def test_wildcard_handler(self, mock_auth):
@@ -594,6 +644,21 @@ class TestOrderBookHandler:
         book = orderbook_tracker.get(sample_market_data["marketSlug"])
         assert book is not None
         assert book.yes_best_bid == Decimal("0.47")
+
+    @pytest.mark.asyncio
+    async def test_handler_updates_tracker_bids_offers(
+        self, orderbook_tracker, sample_market_data_bids_offers
+    ):
+        """Test handler supports top-level bids/offers market data."""
+        from src.data.orderbook import create_orderbook_handler
+
+        handler = create_orderbook_handler(orderbook_tracker)
+        await handler(sample_market_data_bids_offers)
+
+        book = orderbook_tracker.get(sample_market_data_bids_offers["marketSlug"])
+        assert book is not None
+        assert book.yes_best_bid == Decimal("0.47")
+        assert book.yes_best_ask == Decimal("0.49")
     
     @pytest.mark.asyncio
     async def test_handler_ignores_non_market_data(self, orderbook_tracker):

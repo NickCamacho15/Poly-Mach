@@ -207,9 +207,23 @@ class OrderBookTracker:
                 )
                 return
         
-        # Parse order book sides
-        yes_side = self._parse_side(data.get("yes", {}))
-        no_side = self._parse_side(data.get("no", {}))
+        # Parse order book sides.
+        #
+        # Documented format is {"yes": {"bids": ..., "asks": ...}, "no": ...}
+        # but live sports feeds can emit top-level {"bids": ..., "offers": ...}.
+        yes_data = data.get("yes")
+        no_data = data.get("no")
+        if not yes_data and ("bids" in data or "offers" in data or "asks" in data):
+            yes_data = {
+                "bids": data.get("bids", []),
+                "asks": data.get("offers", data.get("asks", [])),
+            }
+        else:
+            yes_data = yes_data or {}
+        no_data = no_data or {}
+
+        yes_side = self._parse_side(yes_data)
+        no_side = self._parse_side(no_data)
         
         # Create or update state
         self._books[market_slug] = OrderBookState(
@@ -240,33 +254,56 @@ class OrderBookTracker:
         bids = []
         asks = []
         
-        # Parse bids: [[price, quantity], ...]
-        for level in side_data.get("bids", []):
+        bids_levels = side_data.get("bids", [])
+        asks_levels = side_data.get("asks", side_data.get("offers", []))
+
+        def _parse_qty(raw: object) -> Optional[int]:
+            try:
+                return int(Decimal(str(raw)))
+            except Exception:
+                return None
+
+        def _parse_level(level: object) -> Optional[PriceLevel]:
             if isinstance(level, (list, tuple)) and len(level) >= 2:
                 price, quantity = level[0], level[1]
-                bids.append(PriceLevel(
+                qty = _parse_qty(quantity)
+                if qty is None:
+                    return None
+                return PriceLevel(
                     price=Decimal(str(price)),
-                    quantity=int(quantity),
-                ))
-            elif isinstance(level, dict):
-                bids.append(PriceLevel(
-                    price=Decimal(str(level.get("price", "0"))),
-                    quantity=int(level.get("quantity", 0)),
-                ))
+                    quantity=qty,
+                )
+            if isinstance(level, dict):
+                if "px" in level:
+                    px = level.get("px")
+                    if isinstance(px, dict):
+                        price = px.get("value", "0")
+                    else:
+                        price = px
+                    quantity = level.get("qty", 0)
+                else:
+                    price = level.get("price", "0")
+                    quantity = level.get("quantity", level.get("size", 0))
+                qty = _parse_qty(quantity)
+                if qty is None:
+                    return None
+                return PriceLevel(
+                    price=Decimal(str(price)),
+                    quantity=qty,
+                )
+            return None
+
+        # Parse bids: [[price, quantity], ...]
+        for level in bids_levels:
+            parsed = _parse_level(level)
+            if parsed is not None:
+                bids.append(parsed)
         
         # Parse asks
-        for level in side_data.get("asks", []):
-            if isinstance(level, (list, tuple)) and len(level) >= 2:
-                price, quantity = level[0], level[1]
-                asks.append(PriceLevel(
-                    price=Decimal(str(price)),
-                    quantity=int(quantity),
-                ))
-            elif isinstance(level, dict):
-                asks.append(PriceLevel(
-                    price=Decimal(str(level.get("price", "0"))),
-                    quantity=int(level.get("quantity", 0)),
-                ))
+        for level in asks_levels:
+            parsed = _parse_level(level)
+            if parsed is not None:
+                asks.append(parsed)
         
         # Sort: bids descending (best first), asks ascending (best first)
         bids.sort(key=lambda x: x.price, reverse=True)
@@ -642,11 +679,23 @@ def create_orderbook_handler(tracker: OrderBookTracker):
         market_slug = data.get("marketSlug")
         if not market_slug:
             return
-        
+
+        # Live feeds may emit top-level "bids" + "offers" rather than nested
+        # {"yes": {"bids": ..., "asks": ...}, "no": ...}. Normalize to the
+        # tracker format so best bid/ask populate correctly.
+        normalized = data
+        if "yes" not in data and ("bids" in data or "offers" in data):
+            normalized = dict(data)
+            normalized["yes"] = {
+                "bids": data.get("bids", []),
+                "asks": data.get("offers", []),
+            }
+            normalized.setdefault("no", {"bids": [], "asks": []})
+
         await tracker.update_async(
             market_slug=market_slug,
-            data=data,
-            sequence=data.get("sequence"),
+            data=normalized,
+            sequence=normalized.get("sequence"),
         )
     
     return handler

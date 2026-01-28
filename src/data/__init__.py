@@ -41,6 +41,20 @@ from .orderbook import (
     OrderBookTracker,
     create_orderbook_handler,
 )
+from .market_discovery import (
+    League,
+    MarketProduct,
+    SportsMarketType,
+    SportsMarket,
+    GameMarkets,
+    MarketDiscovery,
+    get_basketball_slugs,
+    get_nba_slugs,
+    get_cbb_slugs,
+)
+from .event_bus import EventBus, EVENT_GAME_STATE, EVENT_ODDS_SNAPSHOT
+from .sports_feed import GameState, GameStatus, SportsFeed, MockSportsFeed
+from .odds_feed import OddsFeed, OddsSnapshot, MockOddsFeed
 
 __all__ = [
     # Enums
@@ -76,4 +90,27 @@ __all__ = [
     "OrderBookState",
     "OrderBookTracker",
     "create_orderbook_handler",
+    # Market discovery
+    "League",
+    "MarketProduct",
+    "SportsMarketType",
+    "SportsMarket",
+    "GameMarkets",
+    "MarketDiscovery",
+    "get_basketball_slugs",
+    "get_nba_slugs",
+    "get_cbb_slugs",
+    # Event bus
+    "EventBus",
+    "EVENT_GAME_STATE",
+    "EVENT_ODDS_SNAPSHOT",
+    # Sports feed
+    "GameState",
+    "GameStatus",
+    "SportsFeed",
+    "MockSportsFeed",
+    # Odds feed
+    "OddsFeed",
+    "OddsSnapshot",
+    "MockOddsFeed",
 ]

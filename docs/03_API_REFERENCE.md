@@ -661,6 +661,167 @@ asyncio.run(main())
 
 ---
 
+---
+
+## Sports Markets
+
+### Market Types
+
+| Product Code | Name | Description |
+|--------------|------|-------------|
+| `aec` | Athletic Event Contract | Moneyline (who wins) |
+| `asc` | Athletic Spread Contract | Point spread (handicap) |
+| `tsc` | Total Score Contract | Over/under total points |
+| `tec` | Title Event Contract | Championship/title markets |
+| `tac` | Title Award Contract | Award markets (MVP, etc.) |
+
+### Sports Market Type Enum
+
+| Type | Description |
+|------|-------------|
+| `SPORTS_MARKET_TYPE_MONEYLINE` | Winner of the game |
+| `SPORTS_MARKET_TYPE_SPREAD` | Point spread (handicap) |
+| `SPORTS_MARKET_TYPE_TOTAL` | Over/under total points |
+| `SPORTS_MARKET_TYPE_PROP` | Player or game props |
+
+### Series Codes
+
+| Code | League |
+|------|--------|
+| `nba` | National Basketball Association |
+| `cbb` | College Basketball (NCAAB) |
+| `nfl` | National Football League |
+| `cfb` | College Football |
+| `nhl` | National Hockey League |
+| `mlb` | Major League Baseball |
+
+### Market Slug Format
+
+```
+{product}-{series}-{teams}-{date}-{line}
+```
+
+**Examples:**
+
+| Type | Slug Pattern | Example |
+|------|--------------|---------|
+| Moneyline | `aec-{series}-{away}-{home}-{date}` | `aec-nba-lal-bos-2025-01-27` |
+| Spread | `asc-{series}-{away}-{home}-{date}-{line}` | `asc-nba-lal-bos-2025-01-27-4-5` |
+| Total | `tsc-{series}-{away}-{home}-{date}-{line}` | `tsc-cbb-duke-unc-2025-02-01-145-5` |
+
+### Finding Sports Markets
+
+**GET** `/v1/markets`
+
+**Query Parameters for Sports:**
+
+```python
+params = {
+    "active": True,
+    "categories": "sports",
+    "limit": 100
+}
+```
+
+### Sports Market Response
+
+```json
+{
+  "markets": [
+    {
+      "id": 12345,
+      "slug": "aec-nba-lal-bos-2025-01-27",
+      "question": "Will Lakers beat Celtics?",
+      "description": "Lakers vs Celtics - January 27, 2025",
+      "active": true,
+      "closed": false,
+      "sportsMarketTypeV2": "MONEYLINE",
+      "gameId": "provider-game-id",
+      "line": null,
+      "lastTradePrice": 0.55,
+      "bestBid": 0.54,
+      "bestAsk": 0.56,
+      "spread": 0.02,
+      "volume": "50000",
+      "liquidity": "12500",
+      "metadata": {
+        "event_category": "spr",
+        "event_series": "nba",
+        "instrument_product": "aec",
+        "long_participant_id": "nba-lal",
+        "long_participant_name": "Los Angeles Lakers",
+        "short_participant_id": "nba-bos",
+        "short_participant_name": "Boston Celtics"
+      }
+    }
+  ]
+}
+```
+
+### Key Metadata Fields
+
+| Field | Description |
+|-------|-------------|
+| `event_series` | League code: `nba`, `cbb`, `nfl`, etc. |
+| `event_category` | Always `spr` for sports |
+| `instrument_product` | Market type: `aec`, `asc`, `tsc` |
+| `long_participant_id` | Team/player to bet YES on |
+| `long_participant_name` | Full display name |
+| `short_participant_id` | Opposing team/player |
+| `short_participant_name` | Opposing full name |
+| `gameId` | Sports data provider game ID |
+| `line` | Spread or total line (e.g., `4.5`, `215.5`) |
+
+### Trading Note
+
+- **Buy YES (long)** = Bet on `long_participant` (team listed first)
+- **Buy NO (short)** = Bet on `short_participant` (opposing team)
+
+### Filtering by League
+
+To find all NBA markets:
+
+```python
+# Get all active markets
+markets = await client.get_markets(category="sports", status="OPEN")
+
+# Filter for NBA
+nba_markets = [
+    m for m in markets 
+    if m.metadata.get("event_series") == "nba"
+]
+
+# Filter for College Basketball
+cbb_markets = [
+    m for m in markets 
+    if m.metadata.get("event_series") == "cbb"
+]
+```
+
+### Filtering by Market Type
+
+```python
+# Moneyline only
+moneyline_markets = [
+    m for m in markets 
+    if m.slug.startswith("aec-")
+]
+
+# Spread only
+spread_markets = [
+    m for m in markets 
+    if m.slug.startswith("asc-")
+]
+
+# Totals only
+total_markets = [
+    m for m in markets 
+    if m.slug.startswith("tsc-")
+]
+```
+
+---
+
 ## Fee Schedule
 
 | Type | Fee |

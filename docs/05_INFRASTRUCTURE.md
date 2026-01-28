@@ -115,6 +115,8 @@ exit
 
 ### Dockerfile
 
+Use the `Dockerfile` at the repo root. For reference:
+
 ```dockerfile
 FROM python:3.11-slim
 
@@ -131,10 +133,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application
 COPY src/ ./src/
-COPY config/ ./config/
 
-# Create non-root user
-RUN useradd -m botuser && chown -R botuser:botuser /app
+# Create non-root user and runtime directories
+RUN useradd -m botuser \
+    && mkdir -p /app/logs /app/data \
+    && chown -R botuser:botuser /app
 USER botuser
 
 # Set environment
@@ -147,8 +150,10 @@ CMD ["python", "-m", "src.main"]
 
 ### docker-compose.yml
 
+Use the `docker-compose.yml` at the repo root. For reference:
+
 ```yaml
-version: '3.8'
+version: "3.8"
 
 services:
   bot:
@@ -166,7 +171,13 @@ services:
         max-size: "100m"
         max-file: "5"
     healthcheck:
-      test: ["CMD", "python", "-c", "import requests; requests.get('http://localhost:8080/health')"]
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request as u; u.urlopen('http://localhost:8080/health')",
+        ]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -195,6 +206,28 @@ docker-compose logs -f
 docker-compose down
 ```
 
+### Environment Variables
+
+All runtime settings are environment-driven (see `src/config.py`). Minimum required:
+
+- `PM_API_KEY_ID`
+- `PM_PRIVATE_KEY`
+- `MARKET_SLUGS` (comma-separated)
+
+Common optional settings:
+
+- `PM_BASE_URL`, `PM_WS_URL`
+- `TRADING_MODE` (`paper` or `live`), `INITIAL_BALANCE`
+- Risk: `RISK_MAX_POSITION_PER_MARKET`, `RISK_MAX_PORTFOLIO_EXPOSURE`,
+  `RISK_MAX_DAILY_LOSS`, `RISK_KELLY_FRACTION`, `RISK_MIN_EDGE`,
+  `RISK_MIN_TRADE_SIZE`, `RISK_MAX_CORRELATED_EXPOSURE`,
+  `RISK_MAX_POSITIONS`, `RISK_MAX_DRAWDOWN_PCT`
+- Logging: `LOG_LEVEL`, `LOG_FILE`, `LOG_JSON`
+- Health: `HEALTH_HOST`, `HEALTH_PORT`
+- Integrations: `OPTICODDS_API_KEY`, `DISCORD_WEBHOOK`
+
+Use decimal strings for money/percent values (e.g., `50.00`, `0.25`).
+
 ---
 
 ## Systemd Service (Alternative to Docker)
@@ -202,6 +235,8 @@ docker-compose down
 If you prefer running without Docker:
 
 ### /etc/systemd/system/polymarket-bot.service
+
+Use the repo-provided unit file at `deploy/systemd/polymarket-bot.service`:
 
 ```ini
 [Unit]
@@ -287,7 +322,8 @@ wget https://s3.amazonaws.com/amazoncloudwatch-agent/ubuntu/amd64/latest/amazon-
 sudo dpkg -i amazon-cloudwatch-agent.deb
 ```
 
-Configure `/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json`:
+Copy `deploy/cloudwatch/amazon-cloudwatch-agent.json` to
+`/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json`:
 
 ```json
 {
@@ -441,7 +477,7 @@ class TelegramNotifier:
 
 ### Daily Backups
 
-Create `/home/ubuntu/backup.sh`:
+Use `deploy/backup/backup.sh` and copy it to `/home/ubuntu/backup.sh`:
 
 ```bash
 #!/bin/bash

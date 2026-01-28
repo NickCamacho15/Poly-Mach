@@ -630,9 +630,67 @@ class StateManager:
             if not market_slug:
                 return
             
-            # Extract prices from order book data
-            yes_data = data.get("yes", {})
-            no_data = data.get("no", {})
+            def _parse_price_levels(levels: Any) -> List[tuple[Decimal, int]]:
+                """
+                Normalize various orderbook level shapes into [(price, qty), ...].
+
+                Supports:
+                - [price, qty]
+                - {"price": ..., "quantity": ...}
+                - {"price": ..., "size": ...}  (some feeds use size)
+                """
+                if not isinstance(levels, list):
+                    return []
+
+                def _parse_qty(raw: Any) -> Optional[int]:
+                    try:
+                        return int(Decimal(str(raw)))
+                    except Exception:
+                        return None
+
+                parsed: List[tuple[Decimal, int]] = []
+                for level in levels:
+                    try:
+                        if isinstance(level, (list, tuple)) and len(level) >= 2:
+                            price = Decimal(str(level[0]))
+                            qty = _parse_qty(level[1])
+                            if qty is not None:
+                                parsed.append((price, qty))
+                        elif isinstance(level, dict):
+                            if "px" in level:
+                                px = level.get("px")
+                                if isinstance(px, dict):
+                                    price_raw = px.get("value", "0")
+                                else:
+                                    price_raw = px
+                                qty_raw = level.get("qty", 0)
+                            else:
+                                price_raw = level.get("price", "0")
+                                qty_raw = level.get("quantity", level.get("size", 0))
+                            price = Decimal(str(price_raw))
+                            qty = _parse_qty(qty_raw)
+                            if qty is not None:
+                                parsed.append((price, qty))
+                    except Exception:
+                        # Ignore malformed levels
+                        continue
+                return parsed
+
+            # Extract prices from order book data.
+            #
+            # The documented format is {"yes": {"bids": ..., "asks": ...}, "no": ...}
+            # but live sports markets may emit top-level {"bids": ..., "offers": ...}.
+            yes_data = data.get("yes")
+            no_data = data.get("no")
+            if not yes_data and ("bids" in data or "offers" in data or "asks" in data):
+                yes_data = {
+                    "bids": data.get("bids", []),
+                    "asks": data.get("offers", data.get("asks", [])),
+                }
+                no_data = no_data or {}
+            else:
+                yes_data = yes_data or {}
+                no_data = no_data or {}
             
             # Parse YES side
             yes_bids = yes_data.get("bids", [])
@@ -643,25 +701,18 @@ class StateManager:
             yes_bid_size = 0
             yes_ask_size = 0
             
-            if yes_bids:
-                # Bids are sorted descending (best first)
-                best_bid = yes_bids[0]
-                if isinstance(best_bid, (list, tuple)):
-                    yes_bid = Decimal(str(best_bid[0]))
-                    yes_bid_size = int(best_bid[1])
-                elif isinstance(best_bid, dict):
-                    yes_bid = Decimal(str(best_bid.get("price", "0")))
-                    yes_bid_size = int(best_bid.get("quantity", 0))
+            parsed_yes_bids = _parse_price_levels(yes_bids)
+            parsed_yes_asks = _parse_price_levels(yes_asks)
+
+            if parsed_yes_bids:
+                best_bid_price, best_bid_qty = max(parsed_yes_bids, key=lambda x: x[0])
+                yes_bid = best_bid_price
+                yes_bid_size = best_bid_qty
             
-            if yes_asks:
-                # Asks are sorted ascending (best first)
-                best_ask = yes_asks[0]
-                if isinstance(best_ask, (list, tuple)):
-                    yes_ask = Decimal(str(best_ask[0]))
-                    yes_ask_size = int(best_ask[1])
-                elif isinstance(best_ask, dict):
-                    yes_ask = Decimal(str(best_ask.get("price", "0")))
-                    yes_ask_size = int(best_ask.get("quantity", 0))
+            if parsed_yes_asks:
+                best_ask_price, best_ask_qty = min(parsed_yes_asks, key=lambda x: x[0])
+                yes_ask = best_ask_price
+                yes_ask_size = best_ask_qty
             
             # Parse NO side
             no_bids = no_data.get("bids", [])
@@ -670,19 +721,14 @@ class StateManager:
             no_bid = None
             no_ask = None
             
-            if no_bids:
-                best_bid = no_bids[0]
-                if isinstance(best_bid, (list, tuple)):
-                    no_bid = Decimal(str(best_bid[0]))
-                elif isinstance(best_bid, dict):
-                    no_bid = Decimal(str(best_bid.get("price", "0")))
+            parsed_no_bids = _parse_price_levels(no_bids)
+            parsed_no_asks = _parse_price_levels(no_asks)
+
+            if parsed_no_bids:
+                no_bid, _ = max(parsed_no_bids, key=lambda x: x[0])
             
-            if no_asks:
-                best_ask = no_asks[0]
-                if isinstance(best_ask, (list, tuple)):
-                    no_ask = Decimal(str(best_ask[0]))
-                elif isinstance(best_ask, dict):
-                    no_ask = Decimal(str(best_ask.get("price", "0")))
+            if parsed_no_asks:
+                no_ask, _ = min(parsed_no_asks, key=lambda x: x[0])
             
             # Update state
             self.update_market(

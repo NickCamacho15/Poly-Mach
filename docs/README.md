@@ -58,6 +58,30 @@ Reference documents (read as needed):
 
 ---
 
+## Deployment (Phase 7)
+
+Use the repo’s Docker assets (`Dockerfile`, `docker-compose.yml`) and the
+deployment helpers under `deploy/` (systemd unit, CloudWatch config, backup
+script). Full steps are in `05_INFRASTRUCTURE.md`.
+
+Minimum environment variables:
+
+- `PM_API_KEY_ID`
+- `PM_PRIVATE_KEY`
+- `MARKET_SLUGS`
+
+Common optional settings:
+
+- `TRADING_MODE`, `INITIAL_BALANCE`
+- Risk: `RISK_MAX_POSITION_PER_MARKET`, `RISK_MAX_PORTFOLIO_EXPOSURE`,
+  `RISK_MAX_DAILY_LOSS`, `RISK_KELLY_FRACTION`, `RISK_MIN_EDGE`,
+  `RISK_MIN_TRADE_SIZE`, `RISK_MAX_CORRELATED_EXPOSURE`,
+  `RISK_MAX_POSITIONS`, `RISK_MAX_DRAWDOWN_PCT`
+- Logging: `LOG_LEVEL`, `LOG_FILE`, `LOG_JSON`
+- Health: `HEALTH_HOST`, `HEALTH_PORT`
+
+---
+
 ## Risk Parameters (For $1,000 Account)
 
 | Parameter | Value |
@@ -181,6 +205,16 @@ Before going live, your paper trading should show:
 | Max Drawdown | < 10% |
 | Profitable Days | > 60% |
 | Paper Trading Duration | 2+ weeks |
+
+---
+
+## Testing
+
+Unit tests:
+`pytest -v`
+
+Integration tests (opt-in; requires PM_API_KEY_ID and PM_PRIVATE_KEY in .env):
+`RUN_INTEGRATION_TESTS=1 pytest -m integration -v`
 
 ---
 

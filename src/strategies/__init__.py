@@ -32,7 +32,9 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from .base_strategy import BaseStrategy, Signal, SignalAction, Urgency
+    from .live_arbitrage import LiveArbitrageConfig, LiveArbitrageStrategy
     from .market_maker import MarketMakerConfig, MarketMakerStrategy, QuoteState
+    from .statistical_edge import StatisticalEdgeConfig, StatisticalEdgeStrategy
     from .strategy_engine import AggregatedSignals, SignalAggregator, StrategyEngine
 
 __all__ = [
@@ -45,6 +47,12 @@ __all__ = [
     "MarketMakerConfig",
     "MarketMakerStrategy",
     "QuoteState",
+    # Live arbitrage
+    "LiveArbitrageConfig",
+    "LiveArbitrageStrategy",
+    # Statistical edge
+    "StatisticalEdgeConfig",
+    "StatisticalEdgeStrategy",
     # Strategy engine
     "AggregatedSignals",
     "SignalAggregator",
@@ -86,5 +94,22 @@ def __getattr__(name: str) -> Any:
             "SignalAggregator": SignalAggregator,
             "StrategyEngine": StrategyEngine,
         }[name]
+
+    if name in {"LiveArbitrageConfig", "LiveArbitrageStrategy"}:
+        from .live_arbitrage import LiveArbitrageConfig, LiveArbitrageStrategy
+
+        return {
+            "LiveArbitrageConfig": LiveArbitrageConfig,
+            "LiveArbitrageStrategy": LiveArbitrageStrategy,
+        }[name]
+
+    if name in {"StatisticalEdgeConfig", "StatisticalEdgeStrategy"}:
+        from .statistical_edge import StatisticalEdgeConfig, StatisticalEdgeStrategy
+
+        return {
+            "StatisticalEdgeConfig": StatisticalEdgeConfig,
+            "StatisticalEdgeStrategy": StatisticalEdgeStrategy,
+        }[name]
+
 
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

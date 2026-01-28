@@ -7,11 +7,13 @@ handler dispatch, and subscription management for market data and private update
 
 import asyncio
 import json
+import ssl
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Callable, Coroutine, Dict, List, Optional, Set
 
+import certifi
 import structlog
 import websockets
 from websockets.exceptions import ConnectionClosed, InvalidStatusCode
@@ -226,11 +228,15 @@ class PolymarketWebSocket:
                 endpoint=endpoint.value,
             )
             
+            # Create SSL context with certifi certificates (fixes macOS SSL issues)
+            ssl_context = ssl.create_default_context(cafile=certifi.where())
+            
             self._ws = await websockets.connect(
                 url,
                 extra_headers=headers,
                 ping_interval=self.PING_INTERVAL,
                 ping_timeout=self.PING_TIMEOUT,
+                ssl=ssl_context,
             )
             
             self._state = ConnectionState.CONNECTED
@@ -543,6 +549,45 @@ class PolymarketWebSocket:
                     self._reconnect_task = asyncio.create_task(self._reconnect())
                     await self._reconnect_task
     
+    def _normalize_message(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Normalize live WebSocket messages to the documented format.
+
+        Polymarket messages may arrive wrapped with `subscriptionType` and a payload
+        (e.g., `marketData`) instead of a top-level `type`. This method unwraps
+        known payloads and injects a `type` field so existing handlers work.
+        """
+        if "type" in data:
+            return data
+
+        subscription_type = data.get("subscriptionType")
+        if not subscription_type:
+            return data
+
+        mapping = {
+            SubscriptionType.MARKET_DATA.value: ("MARKET_DATA", "marketData"),
+            SubscriptionType.MARKET_DATA_LITE.value: ("MARKET_DATA", "marketData"),
+            SubscriptionType.TRADE.value: ("TRADE", "trade"),
+            SubscriptionType.ORDER.value: ("ORDER_UPDATE", "order"),
+            SubscriptionType.POSITION.value: ("POSITION_UPDATE", "position"),
+            SubscriptionType.ACCOUNT_BALANCE.value: ("ACCOUNT_BALANCE_UPDATE", "accountBalance"),
+        }
+
+        mapped = mapping.get(subscription_type)
+        if not mapped:
+            return data
+
+        event_type, payload_key = mapped
+        normalized = dict(data)
+
+        payload = data.get(payload_key)
+        if isinstance(payload, dict):
+            for key, value in payload.items():
+                normalized.setdefault(key, value)
+
+        normalized["type"] = event_type
+        return normalized
+
     async def _handle_message(self, raw_message: str) -> None:
         """
         Parse and dispatch a message to handlers.
@@ -556,7 +601,15 @@ class PolymarketWebSocket:
             logger.error("Invalid JSON received", message=raw_message[:100])
             return
         
+        data = self._normalize_message(data)
         event_type = data.get("type", "UNKNOWN")
+        
+        # Debug: log all incoming messages
+        logger.debug(
+            "WebSocket message received",
+            event_type=event_type,
+            keys=list(data.keys())[:10],
+        )
         
         # Get handlers for this event type
         handlers = list(self._handlers.get(event_type, []))

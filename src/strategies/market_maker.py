@@ -37,6 +37,11 @@ class MarketMakerConfig(BaseModel):
         price_tolerance: Price movement threshold to trigger refresh
         enabled_markets: List of market patterns to trade (empty = all)
         inventory_skew_factor: How much to skew quotes based on inventory
+        min_spread_pct: Minimum relative spread required to quote (e.g., 0.02 = 2%)
+        maker_only: If True, never cross the spread (post-only style)
+        stop_loss_pct: Hard stop-loss threshold (legacy, in percent)
+        aggressive_stop_loss_pct: Aggressive stop-loss threshold for immediate exit
+        max_underwater_hold_seconds: Max time to hold underwater position before exit
     """
     spread: Decimal = Field(default=Decimal("0.02"), ge=Decimal("0.01"), le=Decimal("0.20"))
     order_size: Decimal = Field(default=Decimal("10.00"), ge=Decimal("1.00"))
@@ -47,6 +52,11 @@ class MarketMakerConfig(BaseModel):
     price_tolerance: Decimal = Field(default=Decimal("0.005"))
     enabled_markets: List[str] = Field(default_factory=list)
     inventory_skew_factor: Decimal = Field(default=Decimal("0.5"))
+    min_spread_pct: Decimal = Field(default=Decimal("0.02"), ge=Decimal("0"), le=Decimal("1"))
+    maker_only: bool = Field(default=True)
+    stop_loss_pct: Decimal = Field(default=Decimal("0.05"), ge=Decimal("0"), le=Decimal("1"))
+    aggressive_stop_loss_pct: Decimal = Field(default=Decimal("0.03"), ge=Decimal("0"), le=Decimal("1"))
+    max_underwater_hold_seconds: int = Field(default=600, ge=60)
     
     class Config:
         """Pydantic config."""
@@ -256,26 +266,28 @@ class MarketMakerStrategy(BaseStrategy):
         
         # Base spread
         half_spread = self.config.spread / 2
-        
-        # Calculate inventory skew if we have a position
-        skew = Decimal("0")
-        if position is not None and position.quantity > 0:
-            # Calculate position value
+
+        # Inventory skew: adjust bid/ask asymmetrically.
+        # Goal:
+        # - If long YES: discourage adding (lower bid) and encourage exiting (lower ask)
+        # - If long NO (short YES): encourage buying YES to close (higher bid) and discourage selling YES (higher ask)
+        bid_skew = Decimal("0")
+        ask_skew = Decimal("0")
+        if position is not None and position.quantity > 0 and self.config.max_inventory > 0:
             position_value = position.avg_price * position.quantity
-            
-            # Skew based on inventory level relative to max
-            if self.config.max_inventory > 0:
-                inventory_ratio = position_value / self.config.max_inventory
-                skew = inventory_ratio * self.config.inventory_skew_factor * half_spread
-                
-                # If long YES, skew to sell YES (lower ask) and discourage more buying (lower bid)
-                if position.side.value == "YES":
-                    skew = -skew  # Move both prices down
-                # If long NO, skew to sell NO (need to adjust opposite)
-        
+            inventory_ratio = min(position_value / self.config.max_inventory, Decimal("2"))
+            skew_amt = inventory_ratio * self.config.inventory_skew_factor * half_spread
+
+            if position.side.value == "YES":
+                bid_skew = -skew_amt
+                ask_skew = -skew_amt
+            else:
+                bid_skew = +skew_amt
+                ask_skew = +skew_amt
+
         # Calculate prices with skew
-        our_bid = mid_price - half_spread + skew
-        our_ask = mid_price + half_spread + skew
+        our_bid = mid_price - half_spread + bid_skew
+        our_ask = mid_price + half_spread + ask_skew
         
         # Clamp to valid range
         our_bid = self.clamp_price(our_bid)
@@ -288,6 +300,57 @@ class MarketMakerStrategy(BaseStrategy):
             our_ask = self.clamp_price(mid_price + half_spread)
         
         return (our_bid, our_ask)
+
+    def _market_spread_pct(self, market: MarketState) -> Optional[Decimal]:
+        """Compute relative spread using YES bid/ask."""
+        if market.yes_bid is None or market.yes_ask is None:
+            return None
+        if market.yes_bid <= 0 or market.yes_ask <= 0 or market.yes_bid >= market.yes_ask:
+            return None
+        mid = (market.yes_bid + market.yes_ask) / 2
+        if mid <= 0:
+            return None
+        return (market.yes_ask - market.yes_bid) / mid
+
+    def _apply_maker_only_prices(
+        self,
+        market: MarketState,
+        *,
+        bid_price: Decimal,
+        ask_price: Decimal,
+        position: Optional[PositionState],
+    ) -> Tuple[Decimal, Decimal]:
+        """
+        Enforce maker-only (post-only) behavior by ensuring:
+        - buy prices do not cross the ask (stay at/below best bid)
+        - sell prices do not cross the bid (stay at/above best ask)
+        """
+        # If we're long YES, make the ask more aggressive to exit by pulling it
+        # toward the best ask (but never below it).
+        if position is not None and position.quantity > 0 and position.side.value == "YES":
+            ask_price = min(ask_price, market.yes_ask or ask_price)
+
+        # If we're long NO, make the bid more aggressive to close by pushing it
+        # toward the best bid (but never above it).
+        if position is not None and position.quantity > 0 and position.side.value != "YES":
+            bid_price = max(bid_price, market.yes_bid or bid_price)
+
+        if market.yes_bid is not None:
+            bid_price = min(bid_price, market.yes_bid)
+        if market.yes_ask is not None:
+            ask_price = max(ask_price, market.yes_ask)
+
+        bid_price = self.clamp_price(bid_price)
+        ask_price = self.clamp_price(ask_price)
+
+        if bid_price >= ask_price:
+            # Keep a valid ordering by widening from mid.
+            mid = market.yes_mid_price or ((market.yes_bid + market.yes_ask) / 2)
+            half = self.config.spread / 2
+            bid_price = self.clamp_price(min(mid - half, market.yes_bid))
+            ask_price = self.clamp_price(max(mid + half, market.yes_ask))
+
+        return bid_price, ask_price
     
     def calculate_quantity(self, price: Decimal) -> int:
         """
@@ -378,9 +441,24 @@ class MarketMakerStrategy(BaseStrategy):
         try:
             # Get current position for skewing
             position = self.get_position(market.market_slug)
+
+            # Minimum spread requirement (avoid tight markets with no edge).
+            spread_pct = self._market_spread_pct(market)
+            if spread_pct is None or spread_pct < self.config.min_spread_pct:
+                return []
             
             # Calculate new quotes
             bid_price, ask_price = self.calculate_quotes(market, position)
+
+            # Maker-only enforcement: ensure we never cross the spread.
+            if self.config.maker_only:
+                bid_price, ask_price = self._apply_maker_only_prices(
+                    market,
+                    bid_price=bid_price,
+                    ask_price=ask_price,
+                    position=position,
+                )
+
             bid_quantity = self.calculate_quantity(bid_price)
             ask_quantity = self.calculate_quantity(ask_price)
             
@@ -416,6 +494,9 @@ class MarketMakerStrategy(BaseStrategy):
                     metadata={
                         "mid_price": float(market.yes_mid_price) if market.yes_mid_price else None,
                         "spread": float(self.config.spread),
+                        "spread_pct": float(spread_pct) if spread_pct is not None else None,
+                        "maker_only": self.config.maker_only,
+                        "post_only": True,
                     },
                 ))
             
@@ -432,6 +513,9 @@ class MarketMakerStrategy(BaseStrategy):
                     metadata={
                         "mid_price": float(market.yes_mid_price) if market.yes_mid_price else None,
                         "spread": float(self.config.spread),
+                        "spread_pct": float(spread_pct) if spread_pct is not None else None,
+                        "maker_only": self.config.maker_only,
+                        "post_only": True,
                     },
                 ))
             
@@ -478,6 +562,122 @@ class MarketMakerStrategy(BaseStrategy):
             Inventory reduction signals if needed
         """
         signals = []
+
+        market = self.get_market(position.market_slug)
+        if not market:
+            return signals
+
+        # Aggressive stop-loss and time-based exits use executable exit prices.
+        exit_price: Optional[Decimal] = None
+        effective_close_price: Optional[Decimal] = None
+        if position.side.value == "YES":
+            exit_price = market.yes_bid
+            effective_close_price = exit_price
+        else:
+            exit_price = market.yes_ask
+            if exit_price is not None:
+                effective_close_price = Decimal("1") - exit_price
+
+        if exit_price is None or effective_close_price is None or position.avg_price <= 0:
+            logger.debug(
+                "Stop-loss evaluation skipped",
+                market_slug=position.market_slug,
+                side=position.side.value,
+                avg_price=float(position.avg_price),
+                yes_bid=float(market.yes_bid) if market.yes_bid else None,
+                yes_ask=float(market.yes_ask) if market.yes_ask else None,
+                no_bid=float(market.no_bid) if market.no_bid else None,
+                no_ask=float(market.no_ask) if market.no_ask else None,
+            )
+        else:
+            pnl_pct = (effective_close_price - position.avg_price) / position.avg_price
+            age_seconds = (datetime.now(timezone.utc) - position.created_at).total_seconds()
+            stop_loss_trigger = pnl_pct <= -self.config.aggressive_stop_loss_pct
+            hard_stop_trigger = pnl_pct <= -self.config.stop_loss_pct
+            time_exit_trigger = (
+                age_seconds >= self.config.max_underwater_hold_seconds and pnl_pct < 0
+            )
+
+            logger.debug(
+                "Stop-loss evaluation",
+                market_slug=position.market_slug,
+                side=position.side.value,
+                avg_price=float(position.avg_price),
+                exit_price=float(exit_price),
+                effective_close_price=float(effective_close_price),
+                pnl_pct=float(pnl_pct),
+                aggressive_threshold=-float(self.config.aggressive_stop_loss_pct),
+                hard_threshold=-float(self.config.stop_loss_pct),
+                time_exit_seconds=self.config.max_underwater_hold_seconds,
+                stop_loss_trigger=stop_loss_trigger,
+                hard_stop_trigger=hard_stop_trigger,
+                time_exit_trigger=time_exit_trigger,
+            )
+
+            if stop_loss_trigger or hard_stop_trigger or time_exit_trigger:
+                if hard_stop_trigger:
+                    exit_kind = "hard_stop_loss"
+                elif stop_loss_trigger:
+                    exit_kind = "stop_loss"
+                else:
+                    exit_kind = "time_exit"
+                if stop_loss_trigger and time_exit_trigger:
+                    exit_kind = "stop_loss_time_exit"
+
+                reason = (
+                    f"Stop-loss exit: unrealized {float(pnl_pct) * 100:.1f}%"
+                    if (stop_loss_trigger or hard_stop_trigger)
+                    else f"Time-based exit: age={int(age_seconds)}s unrealized {float(pnl_pct) * 100:.1f}%"
+                )
+
+                # Aggressive exit: allow crossing for risk-off (taker) even in maker-only mode.
+                if position.side.value == "YES":
+                    if market.yes_bid is not None:
+                        signals.append(self.create_signal(
+                            market_slug=position.market_slug,
+                            action=SignalAction.SELL_YES,
+                            price=self.clamp_price(market.yes_bid),
+                            quantity=position.quantity,
+                            urgency=Urgency.HIGH,
+                            confidence=0.95,
+                            reason=reason,
+                            metadata={
+                                "risk_exit": exit_kind,
+                                "pnl_pct": float(pnl_pct),
+                                "effective_close_price": float(effective_close_price),
+                                "exit_price": float(market.yes_bid),
+                            },
+                        ))
+                else:
+                    if market.yes_ask is not None:
+                        signals.append(self.create_signal(
+                            market_slug=position.market_slug,
+                            action=SignalAction.BUY_YES,
+                            price=self.clamp_price(market.yes_ask),
+                            quantity=position.quantity,
+                            urgency=Urgency.HIGH,
+                            confidence=0.95,
+                            reason=reason,
+                            metadata={
+                                "risk_exit": exit_kind,
+                                "pnl_pct": float(pnl_pct),
+                                "effective_close_price": float(effective_close_price),
+                                "exit_price": float(market.yes_ask),
+                            },
+                        ))
+
+                if signals:
+                    logger.info(
+                        "Risk exit triggered",
+                        market_slug=position.market_slug,
+                        side=position.side.value,
+                        quantity=position.quantity,
+                        avg_price=float(position.avg_price),
+                        effective_close_price=float(effective_close_price),
+                        pnl_pct=float(pnl_pct),
+                        exit_kind=exit_kind,
+                    )
+                    return signals
         
         # Calculate position value
         position_value = position.avg_price * position.quantity
@@ -486,18 +686,13 @@ class MarketMakerStrategy(BaseStrategy):
         if position_value > self.config.max_inventory:
             excess = position_value - self.config.max_inventory
             
-            # Get current market for price
-            market = self.get_market(position.market_slug)
-            if not market:
-                return signals
-            
             # Calculate reduction quantity
             # Reduce by half the excess (gradual reduction)
             reduce_value = excess / 2
             
             if position.side.value == "YES":
                 # Sell YES to reduce long YES position
-                price = market.yes_bid
+                price = market.yes_ask
                 if price is not None and price > 0:
                     reduce_qty = int(reduce_value / price)
                     reduce_qty = min(reduce_qty, position.quantity // 2)  # Max half position
@@ -506,7 +701,7 @@ class MarketMakerStrategy(BaseStrategy):
                         signals.append(self.create_signal(
                             market_slug=position.market_slug,
                             action=SignalAction.SELL_YES,
-                            price=self.clamp_price(price * Decimal("0.98")),  # 2% discount for urgency
+                            price=self.clamp_price(price),  # maker-only: rest at/above ask
                             quantity=reduce_qty,
                             urgency=Urgency.HIGH,
                             confidence=0.9,
@@ -514,7 +709,7 @@ class MarketMakerStrategy(BaseStrategy):
                         ))
             else:
                 # Buy YES to close NO position
-                price = market.yes_ask
+                price = market.yes_bid
                 if price is not None and price > 0:
                     reduce_qty = int(reduce_value / price)
                     reduce_qty = min(reduce_qty, position.quantity // 2)
@@ -523,7 +718,7 @@ class MarketMakerStrategy(BaseStrategy):
                         signals.append(self.create_signal(
                             market_slug=position.market_slug,
                             action=SignalAction.BUY_YES,
-                            price=self.clamp_price(price * Decimal("1.02")),  # 2% premium for urgency
+                            price=self.clamp_price(price),  # maker-only: rest at/at bid
                             quantity=reduce_qty,
                             urgency=Urgency.HIGH,
                             confidence=0.9,
