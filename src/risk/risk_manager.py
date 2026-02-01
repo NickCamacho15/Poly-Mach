@@ -298,4 +298,3 @@ class RiskManager:
         current_equity = self._current_equity()
         drawdown_pct = (self._starting_equity - current_equity) / self._starting_equity
         return drawdown_pct >= self.config.max_total_pnl_drawdown_pct_for_new_buys
-
