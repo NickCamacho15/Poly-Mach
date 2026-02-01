@@ -10,7 +10,6 @@ from datetime import datetime, timezone
 import structlog
 from aiohttp import web
 
-from ..execution.paper_executor import PaperExecutor
 from ..strategies.strategy_engine import StrategyEngine
 from .metrics import FeedMonitor, MetricsRegistry
 
@@ -22,7 +21,7 @@ async def _health_handler(request: web.Request) -> web.Response:
     feed_monitor: FeedMonitor | None = request.app.get("feed_monitor")
     metrics: MetricsRegistry | None = request.app.get("metrics")
     engine: StrategyEngine | None = request.app.get("engine")
-    executor: PaperExecutor | None = request.app.get("executor")
+    executor = request.app.get("executor")
 
     if feed_monitor is not None:
         data["feeds"] = feed_monitor.snapshot()
@@ -31,8 +30,21 @@ async def _health_handler(request: web.Request) -> web.Response:
     if engine is not None:
         data["engine"] = engine.get_metrics()
     if executor is not None:
-        data["paper_performance"] = executor.get_performance().to_dict()
-        data["positions"] = executor.get_positions_report()
+        # Handle both PaperExecutor and LiveExecutor
+        perf = executor.get_performance()
+        # PaperExecutor returns object with to_dict(), LiveExecutor returns dict
+        if hasattr(perf, 'to_dict'):
+            perf_data = perf.to_dict()
+            data["paper_performance"] = perf_data
+            data["trading_mode"] = "paper"
+        else:
+            perf_data = perf
+            data["live_performance"] = perf_data
+            data["trading_mode"] = "live"
+        
+        # Also include positions if available
+        if hasattr(executor, 'get_positions_report'):
+            data["positions"] = executor.get_positions_report()
 
     return web.json_response(data)
 
@@ -44,7 +56,7 @@ async def run_health_server(
     feed_monitor: FeedMonitor | None = None,
     metrics: MetricsRegistry | None = None,
     engine: StrategyEngine | None = None,
-    executor: PaperExecutor | None = None,
+    executor = None,
 ) -> None:
     app = web.Application()
     if feed_monitor is not None:

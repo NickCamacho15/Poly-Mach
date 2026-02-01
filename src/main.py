@@ -20,6 +20,7 @@ from src.data.orderbook import OrderBookTracker, create_orderbook_handler
 from src.data.odds_feed import MockOddsFeed
 from src.data.sports_feed import MockSportsFeed
 from src.execution.paper_executor import PaperExecutor
+from src.execution.live_executor import LiveExecutor, LiveOrderRequest
 from src.risk.risk_manager import RiskConfig, RiskManager
 from src.state.state_manager import StateManager
 from src.strategies.live_arbitrage import LiveArbitrageConfig, LiveArbitrageStrategy
@@ -154,10 +155,18 @@ def build_risk_config(app_settings: Settings) -> RiskConfig:
     )
 
 
-def build_components(app_settings: Settings) -> AppComponents:
+def build_components(app_settings: Settings, client: Optional[PolymarketClient] = None) -> AppComponents:
     state_manager = StateManager(initial_balance=app_settings.initial_balance)
     orderbook = OrderBookTracker()
-    executor = PaperExecutor(state_manager, orderbook)
+    
+    # Use live executor if trading_mode is live and we have a client
+    if app_settings.trading_mode == "live" and client is not None:
+        from src.execution.live_executor import LiveExecutor
+        executor = LiveExecutor(client, state_manager, orderbook, app_settings.initial_balance)
+        logger.info("Using LIVE executor")
+    else:
+        executor = PaperExecutor(state_manager, orderbook)
+        logger.info("Using PAPER executor")
     risk_manager = RiskManager(build_risk_config(app_settings), state_manager)
     event_bus = EventBus()
     feed_monitor = FeedMonitor(stale_after_seconds=app_settings.feed_stale_seconds)
@@ -246,13 +255,20 @@ async def main() -> None:
     )
     logger.info("Bot starting...", mode=settings.trading_mode)
 
-    components = build_components(settings)
-
     if not settings.pm_api_key_id or not settings.pm_private_key:
         logger.error("Missing API credentials; set PM_API_KEY_ID and PM_PRIVATE_KEY")
         return
 
     auth = PolymarketAuth(settings.pm_api_key_id, settings.pm_private_key)
+    
+    # Create client for live trading
+    client = None
+    if settings.trading_mode == "live":
+        from src.api.client import PolymarketClient
+        client = PolymarketClient(auth=auth)
+        logger.info("Created API client for LIVE trading")
+
+    components = build_components(settings, client)
     
     # Determine market slugs: manual or auto-discovery
     market_slugs: List[str] = []
