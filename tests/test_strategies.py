@@ -1121,6 +1121,93 @@ class TestStrategyEngine:
         
         assert results["executed"] == 1
         assert results["errors"] == 0
+
+    @pytest.mark.asyncio
+    async def test_execute_signals_skips_non_tradeable_past_date_market(
+        self,
+        strategy_engine,
+        orderbook_tracker,
+        state_manager,
+        sample_orderbook_data,
+    ):
+        """
+        Guardrail: signals on past-date sports slugs should be skipped before execution.
+        """
+        market_slug = "aec-nba-dal-mil-2000-01-01"
+        orderbook_tracker.update(market_slug, sample_orderbook_data)
+        state_manager.update_market(
+            market_slug,
+            yes_bid=Decimal("0.47"),
+            yes_ask=Decimal("0.49"),
+            no_bid=Decimal("0.51"),
+            no_ask=Decimal("0.53"),
+        )
+
+        signal = Signal(
+            market_slug=market_slug,
+            action=SignalAction.BUY_YES,
+            price=Decimal("0.49"),
+            quantity=10,
+            urgency=Urgency.HIGH,
+            strategy_name="test",
+            confidence=1.0,
+            reason="Should be blocked by slug-date gate",
+        )
+        results = await strategy_engine.execute_signals([signal])
+        assert results["executed"] == 0
+        assert results["errors"] == 0
+        assert any(d.get("result") == "skipped_not_tradeable" for d in results.get("details", []))
+
+    @pytest.mark.asyncio
+    async def test_execute_signals_allows_today_when_allow_in_game(
+        self,
+        strategy_engine,
+        orderbook_tracker,
+        state_manager,
+        sample_orderbook_data,
+    ):
+        """
+        Guardrail: today-date slugs are blocked unless signal.metadata.allow_in_game=True.
+        """
+        today = datetime.now(timezone.utc).date().isoformat()
+        market_slug = f"aec-nba-dal-mil-{today}"
+        orderbook_tracker.update(market_slug, sample_orderbook_data)
+        state_manager.update_market(
+            market_slug,
+            yes_bid=Decimal("0.47"),
+            yes_ask=Decimal("0.49"),
+            no_bid=Decimal("0.51"),
+            no_ask=Decimal("0.53"),
+        )
+
+        blocked = Signal(
+            market_slug=market_slug,
+            action=SignalAction.BUY_YES,
+            price=Decimal("0.49"),
+            quantity=10,
+            urgency=Urgency.HIGH,
+            strategy_name="test",
+            confidence=1.0,
+            reason="Blocked unless allow_in_game",
+        )
+        res1 = await strategy_engine.execute_signals([blocked])
+        assert res1["executed"] == 0
+        assert any(d.get("result") == "skipped_not_tradeable" for d in res1.get("details", []))
+
+        allowed = Signal(
+            market_slug=market_slug,
+            action=SignalAction.BUY_YES,
+            price=Decimal("0.49"),
+            quantity=10,
+            urgency=Urgency.HIGH,
+            strategy_name="test",
+            confidence=1.0,
+            reason="Allowed with allow_in_game",
+            metadata={"allow_in_game": True},
+        )
+        res2 = await strategy_engine.execute_signals([allowed])
+        assert res2["executed"] == 1
+        assert res2["errors"] == 0
     
     @pytest.mark.asyncio
     async def test_execute_cancel_signal(self, strategy_engine, market_with_book, paper_executor):

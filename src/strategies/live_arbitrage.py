@@ -93,6 +93,8 @@ class LiveArbitrageStrategy(BaseStrategy):
             state = self._latest_states.get(event_id)
             if state is None:
                 continue
+            if state.is_final:
+                continue
             market_slug = self._resolve_market_slug(state)
             if not market_slug:
                 continue
@@ -174,7 +176,7 @@ class LiveArbitrageStrategy(BaseStrategy):
                         urgency=Urgency.HIGH,
                         confidence=min(0.9, 0.55 + (abs(state.score_diff) * 0.05)),
                         reason=f"Live edge {edge_yes:.3f} on score update",
-                        metadata={"true_probability": fair_yes},
+                        metadata={"true_probability": fair_yes, "allow_in_game": True},
                     )
 
         no_ask = market.no_ask
@@ -195,7 +197,7 @@ class LiveArbitrageStrategy(BaseStrategy):
                         urgency=Urgency.HIGH,
                         confidence=min(0.9, 0.55 + (abs(state.score_diff) * 0.05)),
                         reason=f"Live edge {edge_no:.3f} on score update",
-                        metadata={"true_probability": fair_no},
+                        metadata={"true_probability": fair_no, "allow_in_game": True},
                     )
 
         return best_signal

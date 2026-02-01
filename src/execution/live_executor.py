@@ -290,16 +290,12 @@ class LiveExecutor:
             self.failed_trades += 1
             return ExecutionResult(order_id="", status=OrderStatus.REJECTED, error=f"Execution error: {exc}")
 
+        # NOTE: create_order() returns a minimal ack (id + executions). Status/fills
+        # are reconciled via private WS updates and/or REST polling.
         order_id = api_order.order_id
-        raw_status = api_order.status
-        try:
-            status = OrderStatus(raw_status)
-        except Exception:
-            # Polymarket may use non-enum strings in some contexts; map conservatively.
-            status = OrderStatus.OPEN if raw_status not in ("REJECTED", "CANCELLED") else OrderStatus.REJECTED
-
-        filled_qty = int(api_order.filled_quantity or 0)
-        avg_fill_price = api_order.avg_fill_price
+        status = OrderStatus.OPEN
+        filled_qty = 0
+        avg_fill_price = None
 
         # Track order mapping and fee estimate.
         async with self._lock:

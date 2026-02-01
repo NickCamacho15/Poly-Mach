@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import signal
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import List, Optional, Set
 
 import structlog
@@ -32,6 +33,7 @@ from src.strategies.statistical_edge import StatisticalEdgeConfig, StatisticalEd
 from src.strategies.strategy_engine import StrategyEngine
 from src.utils.health import run_health_server
 from src.utils.logging import configure_logging
+from src.utils.market_time import is_tradeable_slug
 from src.utils.metrics import FeedMonitor, MetricsRegistry
 
 logger = structlog.get_logger()
@@ -94,6 +96,8 @@ async def discover_markets(
     client: PolymarketClient,
     leagues: List[League],
     products: Optional[List[MarketProduct]] = None,
+    *,
+    allow_in_game: bool = False,
 ) -> List[str]:
     """
     Auto-discover active markets from the Polymarket API.
@@ -133,6 +137,18 @@ async def discover_markets(
     markets = [m for m in markets if not m.closed]
     
     slugs = [m.slug for m in markets]
+    now = datetime.now(timezone.utc)
+    filtered_slugs = [s for s in slugs if is_tradeable_slug(s, now, allow_in_game=allow_in_game)]
+    dropped = len(slugs) - len(filtered_slugs)
+    if dropped:
+        logger.info(
+            "Filtered non-tradeable slugs (slug date gate)",
+            dropped=dropped,
+            total_before=len(slugs),
+            total_after=len(filtered_slugs),
+            allow_in_game=allow_in_game,
+        )
+    slugs = filtered_slugs
     logger.info(
         "Discovered markets",
         total=len(slugs),
@@ -236,6 +252,8 @@ async def market_refresh_loop(
     leagues: List[League],
     products: Optional[List[MarketProduct]],
     subscribed: Set[str],
+    *,
+    allow_in_game: bool,
 ) -> None:
     """
     Periodically check for new markets and subscribe to them.
@@ -244,7 +262,7 @@ async def market_refresh_loop(
         await asyncio.sleep(MARKET_REFRESH_INTERVAL)
         
         try:
-            current_slugs = await discover_markets(client, leagues, products)
+            current_slugs = await discover_markets(client, leagues, products, allow_in_game=allow_in_game)
             new_slugs = [s for s in current_slugs if s not in subscribed]
             
             if new_slugs:
@@ -315,7 +333,8 @@ async def main() -> None:
         )
         
         async with PolymarketClient(auth) as client:
-            market_slugs = await discover_markets(client, leagues, products)
+            allow_in_game = bool(settings.enable_live_arbitrage or settings.enable_statistical_edge)
+            market_slugs = await discover_markets(client, leagues, products, allow_in_game=allow_in_game)
         
         if not market_slugs:
             logger.error("No markets found for configured leagues")
@@ -427,7 +446,14 @@ async def main() -> None:
                 if not manual_slugs and leagues:
                     async with PolymarketClient(auth) as discovery_client:
                         tasks.append(asyncio.create_task(
-                            market_refresh_loop(discovery_client, ws, leagues, products, subscribed),
+                            market_refresh_loop(
+                                discovery_client,
+                                ws,
+                                leagues,
+                                products,
+                                subscribed,
+                                allow_in_game=bool(settings.enable_live_arbitrage or settings.enable_statistical_edge),
+                            ),
                             name="market_refresh",
                         ))
 
@@ -590,7 +616,14 @@ async def main() -> None:
             if not manual_slugs and leagues:
                 async with PolymarketClient(auth) as discovery_client:
                     tasks.append(asyncio.create_task(
-                        market_refresh_loop(discovery_client, ws, leagues, products, subscribed),
+                        market_refresh_loop(
+                            discovery_client,
+                            ws,
+                            leagues,
+                            products,
+                            subscribed,
+                            allow_in_game=bool(settings.enable_live_arbitrage or settings.enable_statistical_edge),
+                        ),
                         name="market_refresh",
                     ))
 

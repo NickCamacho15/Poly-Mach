@@ -8,9 +8,9 @@ and internal data structures.
 from datetime import datetime
 from decimal import Decimal
 from enum import Enum
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 
 # =============================================================================
@@ -210,6 +210,20 @@ class Order(BaseModel):
     def is_filled(self) -> bool:
         """Check if order is fully filled."""
         return self.status == "FILLED"
+
+
+class CreateOrderResponse(BaseModel):
+    """
+    Minimal create-order response from API.
+
+    Polymarket's create-order endpoint may return only an ID and executions, e.g.
+    {"id": "...", "executions": []}.
+    """
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    order_id: str = Field(validation_alias=AliasChoices("id", "orderId", "order_id"))
+    executions: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class OrderPreview(BaseModel):

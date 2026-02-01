@@ -16,6 +16,7 @@ import structlog
 from .auth import PolymarketAuth, AuthenticationError
 from ..data.models import (
     Balance,
+    CreateOrderResponse,
     Market,
     Order,
     OrderBook,
@@ -330,7 +331,7 @@ class PolymarketClient:
     # Order Endpoints
     # =========================================================================
     
-    async def create_order(self, order: OrderRequest) -> Order:
+    async def create_order(self, order: OrderRequest) -> CreateOrderResponse:
         """
         Create a new order.
         
@@ -347,7 +348,7 @@ class PolymarketClient:
         """
         payload = order.to_api_payload()
         data = await self._request("POST", "/v1/orders", data=payload)
-        return Order.model_validate(data)
+        return CreateOrderResponse.model_validate(data)
     
     async def preview_order(self, order: OrderRequest) -> OrderPreview:
         """

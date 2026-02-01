@@ -21,6 +21,7 @@ from ..execution.executor_protocol import ExecutorProtocol
 from ..state.state_manager import MarketState, PositionState, StateManager
 from ..risk.risk_manager import RiskManager
 from .base_strategy import BaseStrategy, Signal, SignalAction, Urgency
+from ..utils.market_time import is_tradeable_slug
 
 logger = structlog.get_logger()
 
@@ -553,6 +554,23 @@ class StrategyEngine:
         
         for signal in signals:
             try:
+                # Pre-trade guard: do not trade stale/closed-by-time markets.
+                # Always allow CANCEL_ALL (unwinds/cleanup should be allowed).
+                if not signal.is_cancel:
+                    allow_in_game = bool(signal.metadata and signal.metadata.get("allow_in_game"))
+                    if not is_tradeable_slug(signal.market_slug, datetime.now(timezone.utc), allow_in_game=allow_in_game):
+                        logger.info(
+                            "Skipping signal on non-tradeable market (slug date gate)",
+                            signal=signal.to_dict(),
+                            allow_in_game=allow_in_game,
+                        )
+                        results["details"].append({
+                            "signal": signal.to_dict(),
+                            "result": "skipped_not_tradeable",
+                            "allow_in_game": allow_in_game,
+                        })
+                        continue
+
                 # Risk gate (optional)
                 if self.risk_manager is not None:
                     decision = self.risk_manager.evaluate_signal(signal)
