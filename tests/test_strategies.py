@@ -14,6 +14,7 @@ import pytest
 from src.data.models import OrderIntent, OrderStatus, Side
 from src.data.orderbook import OrderBookTracker
 from src.execution.paper_executor import PaperExecutor, PaperOrderRequest
+from src.execution.async_paper_executor import AsyncPaperExecutor
 from src.state.state_manager import MarketState, PositionState, StateManager
 from src.strategies.base_strategy import (
     BaseStrategy,
@@ -53,6 +54,12 @@ def orderbook_tracker() -> OrderBookTracker:
 def paper_executor(state_manager, orderbook_tracker) -> PaperExecutor:
     """Create a PaperExecutor for testing."""
     return PaperExecutor(state_manager, orderbook_tracker)
+
+
+@pytest.fixture
+def async_executor(paper_executor) -> AsyncPaperExecutor:
+    """Async wrapper around the PaperExecutor for StrategyEngine."""
+    return AsyncPaperExecutor(paper_executor)
 
 
 @pytest.fixture
@@ -112,12 +119,12 @@ def market_maker_strategy(market_maker_config) -> MarketMakerStrategy:
 
 
 @pytest.fixture
-def strategy_engine(state_manager, orderbook_tracker, paper_executor) -> StrategyEngine:
+def strategy_engine(state_manager, orderbook_tracker, async_executor) -> StrategyEngine:
     """Create a strategy engine for testing."""
     return StrategyEngine(
         state_manager=state_manager,
         orderbook=orderbook_tracker,
-        executor=paper_executor,
+        executor=async_executor,
         tick_interval=1.0,
     )
 
@@ -1096,7 +1103,8 @@ class TestStrategyEngine:
         
         assert len(signals) == 1
     
-    def test_execute_signals(self, strategy_engine, market_with_book):
+    @pytest.mark.asyncio
+    async def test_execute_signals(self, strategy_engine, market_with_book):
         """Test executing signals."""
         signal = Signal(
             market_slug=market_with_book,
@@ -1109,12 +1117,13 @@ class TestStrategyEngine:
             reason="Test",
         )
         
-        results = strategy_engine.execute_signals([signal])
+        results = await strategy_engine.execute_signals([signal])
         
         assert results["executed"] == 1
         assert results["errors"] == 0
     
-    def test_execute_cancel_signal(self, strategy_engine, market_with_book, paper_executor):
+    @pytest.mark.asyncio
+    async def test_execute_cancel_signal(self, strategy_engine, market_with_book, paper_executor):
         """Test executing cancel signal."""
         # First create a resting order
         order = PaperOrderRequest(
@@ -1137,7 +1146,7 @@ class TestStrategyEngine:
             reason="Cancel all",
         )
         
-        results = strategy_engine.execute_signals([cancel_signal])
+        results = await strategy_engine.execute_signals([cancel_signal])
         
         assert results["cancelled"] >= 1
     
@@ -1185,13 +1194,14 @@ class TestStrategyEngine:
             order = strategy_engine._signal_to_order(signal)
             assert order.intent == expected_intent
     
-    def test_get_metrics(self, strategy_engine, market_maker_strategy, market_with_book, market_state):
+    @pytest.mark.asyncio
+    async def test_get_metrics(self, strategy_engine, market_maker_strategy, market_with_book, market_state):
         """Test metrics collection."""
         strategy_engine.add_strategy(market_maker_strategy)
         
         # Process some updates
         signals = strategy_engine.process_market_update(market_state)
-        strategy_engine.execute_signals(signals)
+        await strategy_engine.execute_signals(signals)
         
         metrics = strategy_engine.get_metrics()
         
@@ -1281,7 +1291,8 @@ class TestStrategyEngineAsync:
 class TestStrategyIntegration:
     """Integration tests for the strategy module."""
     
-    def test_full_signal_flow(
+    @pytest.mark.asyncio
+    async def test_full_signal_flow(
         self,
         state_manager,
         orderbook_tracker,
@@ -1305,7 +1316,7 @@ class TestStrategyIntegration:
         engine = StrategyEngine(
             state_manager=state_manager,
             orderbook=orderbook_tracker,
-            executor=paper_executor,
+            executor=AsyncPaperExecutor(paper_executor),
         )
         
         config = MarketMakerConfig(
@@ -1320,7 +1331,7 @@ class TestStrategyIntegration:
         signals = engine.process_market_update(market)
         
         # Execute signals
-        results = engine.execute_signals(signals)
+        results = await engine.execute_signals(signals)
         
         # Verify execution
         assert results["executed"] > 0
@@ -1349,7 +1360,7 @@ class TestStrategyIntegration:
         engine = StrategyEngine(
             state_manager=state_manager,
             orderbook=orderbook_tracker,
-            executor=paper_executor,
+            executor=AsyncPaperExecutor(paper_executor),
         )
         
         # Add multiple strategies
@@ -1413,7 +1424,7 @@ class TestStrategyIntegration:
         engine = StrategyEngine(
             state_manager=state_manager,
             orderbook=orderbook_tracker,
-            executor=paper_executor,
+            executor=AsyncPaperExecutor(paper_executor),
         )
         
         config = MarketMakerConfig(max_inventory=Decimal("30.00"))
@@ -1432,7 +1443,8 @@ class TestStrategyIntegration:
         high_urgency = [s for s in signals if s.urgency == Urgency.HIGH]
         assert len(high_urgency) > 0
 
-    def test_strategy_position_cache_updates_after_fill(
+    @pytest.mark.asyncio
+    async def test_strategy_position_cache_updates_after_fill(
         self,
         strategy_engine,
         market_maker_strategy,
@@ -1456,14 +1468,15 @@ class TestStrategyIntegration:
             confidence=1.0,
             reason="Test buy fill",
         )
-        strategy_engine.execute_signals([buy_signal])
+        await strategy_engine.execute_signals([buy_signal])
 
         cached = market_maker_strategy.get_position(market_with_book)
         assert cached is not None
         assert cached.side == Side.YES
         assert cached.quantity == 10
 
-    def test_strategy_position_cache_clears_on_close(
+    @pytest.mark.asyncio
+    async def test_strategy_position_cache_clears_on_close(
         self,
         strategy_engine,
         market_maker_strategy,
@@ -1485,7 +1498,7 @@ class TestStrategyIntegration:
             confidence=1.0,
             reason="Open position",
         )
-        strategy_engine.execute_signals([buy_signal])
+        await strategy_engine.execute_signals([buy_signal])
         assert market_maker_strategy.get_position(market_with_book) is not None
 
         # Close the entire position with an immediate fill (sell price <= best bid).
@@ -1499,7 +1512,7 @@ class TestStrategyIntegration:
             confidence=1.0,
             reason="Close position",
         )
-        strategy_engine.execute_signals([sell_signal])
+        await strategy_engine.execute_signals([sell_signal])
 
         assert strategy_engine.state_manager.get_position(market_with_book) is None
         assert market_maker_strategy.get_position(market_with_book) is None

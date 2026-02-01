@@ -16,7 +16,8 @@ import structlog
 
 from ..data.models import OrderIntent
 from ..data.orderbook import OrderBookTracker
-from ..execution.paper_executor import PaperExecutor, PaperOrderRequest
+from ..execution.paper_executor import PaperOrderRequest
+from ..execution.executor_protocol import ExecutorProtocol
 from ..state.state_manager import MarketState, PositionState, StateManager
 from ..risk.risk_manager import RiskManager
 from .base_strategy import BaseStrategy, Signal, SignalAction, Urgency
@@ -178,7 +179,7 @@ class StrategyEngine:
         self,
         state_manager: StateManager,
         orderbook: OrderBookTracker,
-        executor: PaperExecutor,
+        executor: ExecutorProtocol,
         risk_manager: Optional[RiskManager] = None,
         tick_interval: float = 1.0,
         enabled: bool = True,
@@ -295,7 +296,7 @@ class StrategyEngine:
         if market_slug:
             self._pending_position_updates.add(market_slug)
 
-    def _flush_position_updates(self) -> None:
+    async def _flush_position_updates(self) -> None:
         """
         Flush any pending position updates into strategies.
 
@@ -330,7 +331,7 @@ class StrategyEngine:
                     if position is not None:
                         signals = self.process_position_update(position)
                         if signals:
-                            self.execute_signals(signals)
+                            await self.execute_signals(signals)
                     else:
                         for strategy in self._strategies:
                             try:
@@ -532,7 +533,7 @@ class StrategyEngine:
     # Signal Execution
     # =========================================================================
     
-    def execute_signals(self, signals: List[Signal]) -> Dict[str, Any]:
+    async def execute_signals(self, signals: List[Signal]) -> Dict[str, Any]:
         """
         Execute signals through the executor.
         
@@ -587,7 +588,7 @@ class StrategyEngine:
 
                 if signal.is_cancel:
                     # Cancel all orders for the market
-                    cancelled = self.executor.cancel_all_orders(signal.market_slug)
+                    cancelled = await self.executor.cancel_all_orders(signal.market_slug)
                     results["cancelled"] += cancelled
                     results["details"].append({
                         "signal": signal.to_dict(),
@@ -599,7 +600,7 @@ class StrategyEngine:
                     order = self._signal_to_order(signal)
                     
                     # Execute order
-                    result = self.executor.execute_order(order)
+                    result = await self.executor.execute_order(order)
                     
                     if result.is_success:
                         results["executed"] += 1
@@ -643,7 +644,7 @@ class StrategyEngine:
                     # If the order filled, the executor will have notified us via
                     # _mark_position_updated(). Flush here so strategies can react
                     # immediately (inventory/stop-loss logic).
-                    self._flush_position_updates()
+                    await self._flush_position_updates()
                     
             except Exception as e:
                 results["errors"] += 1
@@ -789,10 +790,10 @@ class StrategyEngine:
         
         # Execute any generated signals
         if signals:
-            self.execute_signals(signals)
+            await self.execute_signals(signals)
         
         # Check for resting order fills
-        filled_orders = self.executor.check_resting_orders()
+        filled_orders = await self.executor.check_resting_orders()
         if filled_orders:
             logger.debug(
                 "Resting orders filled",
@@ -800,7 +801,7 @@ class StrategyEngine:
             )
 
         # Resting fills update StateManager via PaperExecutor; flush into strategies.
-        self._flush_position_updates()
+        await self._flush_position_updates()
 
     def _log_portfolio_snapshot(self) -> None:
         now = datetime.now(timezone.utc)
@@ -923,7 +924,7 @@ class StrategyEngine:
                 # Process update and execute signals
                 signals = self.process_market_update(market)
                 if signals:
-                    self.execute_signals(signals)
+                    await self.execute_signals(signals)
         
         return handler
     

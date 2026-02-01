@@ -20,7 +20,9 @@ from src.data.orderbook import OrderBookTracker, create_orderbook_handler
 from src.data.odds_feed import MockOddsFeed
 from src.data.sports_feed import MockSportsFeed
 from src.execution.paper_executor import PaperExecutor
-from src.execution.live_executor import LiveExecutor, LiveOrderRequest
+from src.execution.async_paper_executor import AsyncPaperExecutor
+from src.execution.live_executor import LiveExecutor
+from src.execution.executor_protocol import ExecutorProtocol
 from src.risk.risk_manager import RiskConfig, RiskManager
 from src.state.state_manager import StateManager
 from src.strategies.live_arbitrage import LiveArbitrageConfig, LiveArbitrageStrategy
@@ -41,7 +43,7 @@ MARKET_REFRESH_INTERVAL = 300  # 5 minutes
 class AppComponents:
     state_manager: StateManager
     orderbook: OrderBookTracker
-    executor: PaperExecutor
+    executor: ExecutorProtocol
     risk_manager: RiskManager
     engine: StrategyEngine
     event_bus: EventBus
@@ -161,11 +163,16 @@ def build_components(app_settings: Settings, client: Optional[PolymarketClient] 
     
     # Use live executor if trading_mode is live and we have a client
     if app_settings.trading_mode == "live" and client is not None:
-        from src.execution.live_executor import LiveExecutor
-        executor = LiveExecutor(client, state_manager, orderbook, app_settings.initial_balance)
+        executor = LiveExecutor(
+            client,
+            state_manager,
+            orderbook,
+            initial_balance=app_settings.initial_balance,
+            settings=app_settings,
+        )
         logger.info("Using LIVE executor")
     else:
-        executor = PaperExecutor(state_manager, orderbook)
+        executor = AsyncPaperExecutor(PaperExecutor(state_manager, orderbook))
         logger.info("Using PAPER executor")
     risk_manager = RiskManager(build_risk_config(app_settings), state_manager)
     event_bus = EventBus()
@@ -303,11 +310,23 @@ async def main() -> None:
             return
 
     ws = PolymarketWebSocket(auth, base_url=settings.pm_ws_url)
+    ws_private: Optional[PolymarketWebSocket] = None
+    if settings.trading_mode == "live":
+        ws_private = PolymarketWebSocket(auth, base_url=settings.pm_ws_url)
 
     # Wire handlers in order: state updates -> order book -> strategy engine.
     ws.on("MARKET_DATA", components.state_manager.create_market_handler())
     ws.on("MARKET_DATA", create_orderbook_handler(components.orderbook))
     ws.on("MARKET_DATA", components.engine.create_market_handler())
+
+    # Live mode: also subscribe to private updates (fills/positions/balance).
+    if ws_private is not None and settings.trading_mode == "live":
+        if hasattr(components.executor, "create_order_update_handler"):
+            ws_private.on("ORDER_UPDATE", components.executor.create_order_update_handler())  # type: ignore[attr-defined]
+        if hasattr(components.executor, "create_position_update_handler"):
+            ws_private.on("POSITION_UPDATE", components.executor.create_position_update_handler())  # type: ignore[attr-defined]
+        if hasattr(components.executor, "create_balance_update_handler"):
+            ws_private.on("ACCOUNT_BALANCE_UPDATE", components.executor.create_balance_update_handler())  # type: ignore[attr-defined]
 
     # Track subscribed markets for refresh loop
     subscribed: Set[str] = set(market_slugs)
@@ -316,59 +335,122 @@ async def main() -> None:
         await ws.connect(Endpoint.MARKETS)
         await ws.subscribe(SubscriptionType.MARKET_DATA, market_slugs)
 
-        logger.info("Bot ready", markets=len(market_slugs), mode=settings.trading_mode)
+        # If live mode, also connect the private WebSocket and subscribe.
+        if ws_private is not None:
+            async with ws_private:
+                await ws_private.connect(Endpoint.PRIVATE)
+                await ws_private.subscribe(SubscriptionType.ORDER)
+                await ws_private.subscribe(SubscriptionType.POSITION)
+                await ws_private.subscribe(SubscriptionType.ACCOUNT_BALANCE)
 
-        # Build task list
-        tasks = [
-            ws.run(),
-            components.engine.run(),
-            run_health_server(
-                settings.health_host,
-                settings.health_port,
-                feed_monitor=components.feed_monitor,
-                metrics=components.metrics,
-                engine=components.engine,
-                executor=components.executor,
-            ),
-        ]
+                logger.info("Bot ready", markets=len(market_slugs), mode=settings.trading_mode)
 
-        # Optional feed tasks for live strategies (mock by default)
-        if settings.enable_live_arbitrage or settings.enable_statistical_edge:
-            if settings.use_mock_feeds:
-                if settings.enable_live_arbitrage:
-                    sports_feed = MockSportsFeed(
-                        components.event_bus,
-                        market_slugs,
-                        update_interval=settings.mock_sports_interval,
+                # Build task list
+                tasks = [
+                    ws.run(),
+                    ws_private.run(),
+                    components.engine.run(),
+                    run_health_server(
+                        settings.health_host,
+                        settings.health_port,
                         feed_monitor=components.feed_monitor,
                         metrics=components.metrics,
-                    )
-                    tasks.append(sports_feed.run())
-                if settings.enable_statistical_edge:
-                    odds_feed = MockOddsFeed(
-                        components.event_bus,
-                        market_slugs,
-                        update_interval=settings.mock_odds_interval,
-                        feed_monitor=components.feed_monitor,
-                        metrics=components.metrics,
-                    )
-                    tasks.append(odds_feed.run())
-            else:
-                logger.warning(
-                    "Live strategies enabled but feeds are disabled; set USE_MOCK_FEEDS or configure provider",
-                    live_arbitrage=settings.enable_live_arbitrage,
-                    statistical_edge=settings.enable_statistical_edge,
-                )
-        
-        # Add market refresh loop if auto-discovery is enabled
-        if not manual_slugs and leagues:
-            async with PolymarketClient(auth) as client:
-                tasks.append(
-                    market_refresh_loop(client, ws, leagues, products, subscribed)
-                )
-                await asyncio.gather(*tasks)
+                        engine=components.engine,
+                        executor=components.executor,
+                    ),
+                ]
+
+                # Optional feed tasks for live strategies (mock by default)
+                if settings.enable_live_arbitrage or settings.enable_statistical_edge:
+                    if settings.use_mock_feeds:
+                        if settings.enable_live_arbitrage:
+                            sports_feed = MockSportsFeed(
+                                components.event_bus,
+                                market_slugs,
+                                update_interval=settings.mock_sports_interval,
+                                feed_monitor=components.feed_monitor,
+                                metrics=components.metrics,
+                            )
+                            tasks.append(sports_feed.run())
+                        if settings.enable_statistical_edge:
+                            odds_feed = MockOddsFeed(
+                                components.event_bus,
+                                market_slugs,
+                                update_interval=settings.mock_odds_interval,
+                                feed_monitor=components.feed_monitor,
+                                metrics=components.metrics,
+                            )
+                            tasks.append(odds_feed.run())
+                    else:
+                        logger.warning(
+                            "Live strategies enabled but feeds are disabled; set USE_MOCK_FEEDS or configure provider",
+                            live_arbitrage=settings.enable_live_arbitrage,
+                            statistical_edge=settings.enable_statistical_edge,
+                        )
+
+                # Add market refresh loop if auto-discovery is enabled
+                if not manual_slugs and leagues:
+                    async with PolymarketClient(auth) as client:
+                        tasks.append(
+                            market_refresh_loop(client, ws, leagues, products, subscribed)
+                        )
+                        await asyncio.gather(*tasks)
+                else:
+                    await asyncio.gather(*tasks)
         else:
-            await asyncio.gather(*tasks)
+            logger.info("Bot ready", markets=len(market_slugs), mode=settings.trading_mode)
+
+            # Build task list
+            tasks = [
+                ws.run(),
+                components.engine.run(),
+                run_health_server(
+                    settings.health_host,
+                    settings.health_port,
+                    feed_monitor=components.feed_monitor,
+                    metrics=components.metrics,
+                    engine=components.engine,
+                    executor=components.executor,
+                ),
+            ]
+
+            # Optional feed tasks for live strategies (mock by default)
+            if settings.enable_live_arbitrage or settings.enable_statistical_edge:
+                if settings.use_mock_feeds:
+                    if settings.enable_live_arbitrage:
+                        sports_feed = MockSportsFeed(
+                            components.event_bus,
+                            market_slugs,
+                            update_interval=settings.mock_sports_interval,
+                            feed_monitor=components.feed_monitor,
+                            metrics=components.metrics,
+                        )
+                        tasks.append(sports_feed.run())
+                    if settings.enable_statistical_edge:
+                        odds_feed = MockOddsFeed(
+                            components.event_bus,
+                            market_slugs,
+                            update_interval=settings.mock_odds_interval,
+                            feed_monitor=components.feed_monitor,
+                            metrics=components.metrics,
+                        )
+                        tasks.append(odds_feed.run())
+                else:
+                    logger.warning(
+                        "Live strategies enabled but feeds are disabled; set USE_MOCK_FEEDS or configure provider",
+                        live_arbitrage=settings.enable_live_arbitrage,
+                        statistical_edge=settings.enable_statistical_edge,
+                    )
+
+            # Add market refresh loop if auto-discovery is enabled
+            if not manual_slugs and leagues:
+                async with PolymarketClient(auth) as client:
+                    tasks.append(
+                        market_refresh_loop(client, ws, leagues, products, subscribed)
+                    )
+                    await asyncio.gather(*tasks)
+            else:
+                await asyncio.gather(*tasks)
 
 
 if __name__ == "__main__":

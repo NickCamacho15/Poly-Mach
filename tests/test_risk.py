@@ -12,6 +12,7 @@ import pytest
 from src.data.models import OrderIntent, OrderStatus, Side
 from src.data.orderbook import OrderBookTracker
 from src.execution.paper_executor import PaperExecutor
+from src.execution.async_paper_executor import AsyncPaperExecutor
 from src.state.state_manager import OrderState, StateManager
 from src.strategies.base_strategy import Signal, SignalAction, Urgency
 from src.strategies.strategy_engine import StrategyEngine
@@ -315,10 +316,11 @@ class TestRiskManager:
 
 
 class TestStrategyEngineRiskIntegration:
-    def test_engine_applies_risk_manager_resizing(self):
+    @pytest.mark.asyncio
+    async def test_engine_applies_risk_manager_resizing(self):
         state = StateManager(initial_balance=Decimal("1000"))
         orderbook = OrderBookTracker()
-        executor = PaperExecutor(state, orderbook)
+        executor = AsyncPaperExecutor(PaperExecutor(state, orderbook))
 
         market_slug = "m1"
         orderbook.update(
@@ -362,7 +364,7 @@ class TestStrategyEngineRiskIntegration:
             metadata={"true_probability": "0.60"},
         )
 
-        results = engine.execute_signals([signal])
+        results = await engine.execute_signals([signal])
         assert results["executed"] == 1
 
         pos = state.get_position(market_slug)

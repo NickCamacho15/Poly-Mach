@@ -15,6 +15,8 @@ from .paper_executor import (
     PerformanceMetrics,
     TradeRecord,
 )
+from .async_paper_executor import AsyncPaperExecutor
+from .executor_protocol import ExecutorProtocol
 
 __all__ = [
     "ExecutionError",
@@ -26,4 +28,6 @@ __all__ = [
     "PaperOrderRequest",
     "PerformanceMetrics",
     "TradeRecord",
+    "AsyncPaperExecutor",
+    "ExecutorProtocol",
 ]
