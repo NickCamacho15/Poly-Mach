@@ -134,6 +134,18 @@ class RiskManager:
         """Update circuit breaker based on latest equity."""
         self.circuit_breaker.update(self._current_equity())
 
+    def reset_starting_equity(self) -> None:
+        """
+        Reset the circuit breaker baseline to current equity.
+
+        Intended for live-mode startup after an initial API sync populates
+        StateManager with real balance/positions so daily loss/drawdown checks
+        do not start from a blind default.
+        """
+        self._starting_equity = self._current_equity()
+        self.circuit_breaker.initialize(self._starting_equity)
+        logger.info("RiskManager starting equity reset", starting_equity=float(self._starting_equity))
+
     def evaluate_signal(self, signal: Signal) -> RiskDecision:
         """
         Validate and (optionally) resize a signal.

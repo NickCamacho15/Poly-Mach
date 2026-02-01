@@ -76,6 +76,22 @@ class LiveExecutor:
 
         logger.info("LiveExecutor initialized", initial_balance=float(self._initial_balance))
 
+    async def initialize(self) -> None:
+        """
+        Perform an initial live state sync (balance/positions/open orders).
+
+        This should be called before the engine starts ticking so risk checks do not
+        run against an empty/stale StateManager snapshot.
+        """
+        await self._reconcile_state(force=True)
+        balance = self.state.get_balance()
+        positions = len(self.state.get_all_positions())
+        logger.info(
+            "LiveExecutor initialized: balance=$X, positions=Y",
+            balance=float(balance),
+            positions=positions,
+        )
+
     # ------------------------------------------------------------------
     # Fill listeners
     # ------------------------------------------------------------------
@@ -182,9 +198,27 @@ class LiveExecutor:
         if is_buy and current_position is not None and current_position.side != side:
             try:
                 await self.client.close_position(market_slug)
-                # Reconciliation will pick up position/balance changes.
-                await self._reconcile_state(force=True)
-                self._notify_fill_listeners(market_slug)
+                # Wait for confirmation that the position is closed (avoid double exposure).
+                deadline = asyncio.get_running_loop().time() + 5.0
+                while True:
+                    await self._reconcile_state(force=True)
+                    pos = self.state.get_position(market_slug)
+                    if pos is None or pos.quantity <= 0:
+                        self._notify_fill_listeners(market_slug)
+                        break
+                    if asyncio.get_running_loop().time() >= deadline:
+                        logger.warning(
+                            "Side-flip close not confirmed; aborting new buy",
+                            market_slug=market_slug,
+                            held_side=getattr(pos.side, "value", None),
+                            held_qty=getattr(pos, "quantity", None),
+                        )
+                        return ExecutionResult(
+                            order_id="",
+                            status=OrderStatus.REJECTED,
+                            error="Side-flip close not confirmed within timeout; aborting new buy",
+                        )
+                    await asyncio.sleep(0.25)
             except Exception as exc:
                 return ExecutionResult(
                     order_id="",
@@ -215,6 +249,18 @@ class LiveExecutor:
                     error="Live LIMIT orders require a price",
                 )
             api_price = Price(value=str(submit_order.price))
+
+        # Local balance pre-check (prevents attempting orders beyond available cash).
+        # Note: this is conservative vs exchange behavior (which may allow partial fills).
+        if is_buy and submit_order.order_type == OrderType.LIMIT and submit_order.price is not None:
+            available = self.state.get_balance()
+            required = submit_order.price * submit_order.quantity
+            if required > available:
+                return ExecutionResult(
+                    order_id="",
+                    status=OrderStatus.REJECTED,
+                    error=f"Insufficient balance: need ${required:.2f}, have ${available:.2f}",
+                )
 
         api_req = OrderRequest(
             marketSlug=submit_order.market_slug,

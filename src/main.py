@@ -5,6 +5,7 @@ Polymarket US Trading Bot - Entry Point
 from __future__ import annotations
 
 import asyncio
+import signal
 from dataclasses import dataclass
 from typing import List, Optional, Set
 
@@ -269,13 +270,24 @@ async def main() -> None:
     auth = PolymarketAuth(settings.pm_api_key_id, settings.pm_private_key)
     
     # Create client for live trading
-    client = None
+    live_client: Optional[PolymarketClient] = None
     if settings.trading_mode == "live":
         from src.api.client import PolymarketClient
-        client = PolymarketClient(auth=auth)
+        live_client = PolymarketClient(auth=auth)
         logger.info("Created API client for LIVE trading")
 
-    components = build_components(settings, client)
+    components = build_components(settings, live_client)
+
+    # Live-mode initial state sync (avoid starting blind).
+    if settings.trading_mode == "live" and hasattr(components.executor, "initialize"):
+        try:
+            logger.info("Performing initial live state sync...")
+            await components.executor.initialize()  # type: ignore[attr-defined]
+            # Reset risk breaker baseline now that state has real balance/positions.
+            components.risk_manager.reset_starting_equity()
+            logger.info("Initial live state sync complete")
+        except Exception as exc:
+            logger.warning("Initial live state sync failed", error=str(exc))
     
     # Determine market slugs: manual or auto-discovery
     market_slugs: List[str] = []
@@ -331,6 +343,26 @@ async def main() -> None:
     # Track subscribed markets for refresh loop
     subscribed: Set[str] = set(market_slugs)
 
+    # ---------------------------------------------------------------------
+    # Shutdown handling (SIGTERM/SIGINT)
+    # ---------------------------------------------------------------------
+    shutdown_event = asyncio.Event()
+    shutdown_signal: Optional[str] = None
+
+    def _handle_shutdown(sig: signal.Signals) -> None:
+        nonlocal shutdown_signal
+        if shutdown_signal is None:
+            shutdown_signal = sig.name
+        shutdown_event.set()
+
+    try:
+        loop = asyncio.get_running_loop()
+        loop.add_signal_handler(signal.SIGTERM, _handle_shutdown, signal.SIGTERM)
+        loop.add_signal_handler(signal.SIGINT, _handle_shutdown, signal.SIGINT)
+    except NotImplementedError:
+        # Some platforms/event loops may not support signal handlers.
+        pass
+
     async with ws:
         await ws.connect(Endpoint.MARKETS)
         await ws.subscribe(SubscriptionType.MARKET_DATA, market_slugs)
@@ -347,16 +379,19 @@ async def main() -> None:
 
                 # Build task list
                 tasks = [
-                    ws.run(),
-                    ws_private.run(),
-                    components.engine.run(),
-                    run_health_server(
+                    asyncio.create_task(ws.run(), name="ws_markets"),
+                    asyncio.create_task(ws_private.run(), name="ws_private"),
+                    asyncio.create_task(components.engine.run(), name="engine"),
+                    asyncio.create_task(
+                        run_health_server(
                         settings.health_host,
                         settings.health_port,
                         feed_monitor=components.feed_monitor,
                         metrics=components.metrics,
                         engine=components.engine,
                         executor=components.executor,
+                        ),
+                        name="health_server",
                     ),
                 ]
 
@@ -371,7 +406,7 @@ async def main() -> None:
                                 feed_monitor=components.feed_monitor,
                                 metrics=components.metrics,
                             )
-                            tasks.append(sports_feed.run())
+                            tasks.append(asyncio.create_task(sports_feed.run(), name="sports_feed"))
                         if settings.enable_statistical_edge:
                             odds_feed = MockOddsFeed(
                                 components.event_bus,
@@ -380,7 +415,7 @@ async def main() -> None:
                                 feed_monitor=components.feed_monitor,
                                 metrics=components.metrics,
                             )
-                            tasks.append(odds_feed.run())
+                            tasks.append(asyncio.create_task(odds_feed.run(), name="odds_feed"))
                     else:
                         logger.warning(
                             "Live strategies enabled but feeds are disabled; set USE_MOCK_FEEDS or configure provider",
@@ -390,27 +425,136 @@ async def main() -> None:
 
                 # Add market refresh loop if auto-discovery is enabled
                 if not manual_slugs and leagues:
-                    async with PolymarketClient(auth) as client:
-                        tasks.append(
-                            market_refresh_loop(client, ws, leagues, products, subscribed)
-                        )
-                        await asyncio.gather(*tasks)
+                    async with PolymarketClient(auth) as discovery_client:
+                        tasks.append(asyncio.create_task(
+                            market_refresh_loop(discovery_client, ws, leagues, products, subscribed),
+                            name="market_refresh",
+                        ))
+
+                        async def _shutdown_sequence() -> None:
+                            await shutdown_event.wait()
+                            logger.warning(
+                                "Shutdown signal received, cancelling all open orders...",
+                                signal=shutdown_signal,
+                            )
+                            try:
+                                cancelled = await asyncio.wait_for(
+                                    components.executor.cancel_all_orders(),
+                                    timeout=10.0,
+                                )
+                                logger.warning("Cancel all orders complete", cancelled=cancelled)
+                            except asyncio.TimeoutError:
+                                logger.error("Timeout cancelling open orders")
+                            except Exception as exc:
+                                logger.error("Failed cancelling open orders", error=str(exc))
+                            try:
+                                components.engine.stop()
+                            except Exception:
+                                pass
+                            try:
+                                await asyncio.wait_for(ws.disconnect(), timeout=5.0)
+                            except Exception:
+                                pass
+                            try:
+                                await asyncio.wait_for(ws_private.disconnect(), timeout=5.0)
+                            except Exception:
+                                pass
+                            for t in tasks:
+                                if not t.done():
+                                    t.cancel()
+
+                        shutdown_task = asyncio.create_task(_shutdown_sequence(), name="shutdown")
+                        try:
+                            done, pending = await asyncio.wait(
+                                [*tasks, shutdown_task],
+                                return_when=asyncio.FIRST_COMPLETED,
+                            )
+                            # If something finished unexpectedly, trigger shutdown.
+                            if not shutdown_event.is_set():
+                                shutdown_event.set()
+                            await shutdown_task
+                        finally:
+                            for t in tasks:
+                                t.cancel()
+                            await asyncio.gather(*tasks, return_exceptions=True)
+                            if discovery_client is not None:
+                                try:
+                                    await discovery_client.close()
+                                except Exception:
+                                    pass
+                            if live_client is not None:
+                                try:
+                                    await live_client.close()
+                                except Exception:
+                                    pass
                 else:
-                    await asyncio.gather(*tasks)
+                    async def _shutdown_sequence() -> None:
+                        await shutdown_event.wait()
+                        logger.warning(
+                            "Shutdown signal received, cancelling all open orders...",
+                            signal=shutdown_signal,
+                        )
+                        try:
+                            cancelled = await asyncio.wait_for(
+                                components.executor.cancel_all_orders(),
+                                timeout=10.0,
+                            )
+                            logger.warning("Cancel all orders complete", cancelled=cancelled)
+                        except asyncio.TimeoutError:
+                            logger.error("Timeout cancelling open orders")
+                        except Exception as exc:
+                            logger.error("Failed cancelling open orders", error=str(exc))
+                        try:
+                            components.engine.stop()
+                        except Exception:
+                            pass
+                        try:
+                            await asyncio.wait_for(ws.disconnect(), timeout=5.0)
+                        except Exception:
+                            pass
+                        try:
+                            await asyncio.wait_for(ws_private.disconnect(), timeout=5.0)
+                        except Exception:
+                            pass
+                        for t in tasks:
+                            if not t.done():
+                                t.cancel()
+
+                    shutdown_task = asyncio.create_task(_shutdown_sequence(), name="shutdown")
+                    try:
+                        done, pending = await asyncio.wait(
+                            [*tasks, shutdown_task],
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        if not shutdown_event.is_set():
+                            shutdown_event.set()
+                        await shutdown_task
+                    finally:
+                        for t in tasks:
+                            t.cancel()
+                        await asyncio.gather(*tasks, return_exceptions=True)
+                        if live_client is not None:
+                            try:
+                                await live_client.close()
+                            except Exception:
+                                pass
         else:
             logger.info("Bot ready", markets=len(market_slugs), mode=settings.trading_mode)
 
             # Build task list
             tasks = [
-                ws.run(),
-                components.engine.run(),
-                run_health_server(
+                asyncio.create_task(ws.run(), name="ws_markets"),
+                asyncio.create_task(components.engine.run(), name="engine"),
+                asyncio.create_task(
+                    run_health_server(
                     settings.health_host,
                     settings.health_port,
                     feed_monitor=components.feed_monitor,
                     metrics=components.metrics,
                     engine=components.engine,
                     executor=components.executor,
+                    ),
+                    name="health_server",
                 ),
             ]
 
@@ -425,7 +569,7 @@ async def main() -> None:
                             feed_monitor=components.feed_monitor,
                             metrics=components.metrics,
                         )
-                        tasks.append(sports_feed.run())
+                        tasks.append(asyncio.create_task(sports_feed.run(), name="sports_feed"))
                     if settings.enable_statistical_edge:
                         odds_feed = MockOddsFeed(
                             components.event_bus,
@@ -434,7 +578,7 @@ async def main() -> None:
                             feed_monitor=components.feed_monitor,
                             metrics=components.metrics,
                         )
-                        tasks.append(odds_feed.run())
+                        tasks.append(asyncio.create_task(odds_feed.run(), name="odds_feed"))
                 else:
                     logger.warning(
                         "Live strategies enabled but feeds are disabled; set USE_MOCK_FEEDS or configure provider",
@@ -444,13 +588,104 @@ async def main() -> None:
 
             # Add market refresh loop if auto-discovery is enabled
             if not manual_slugs and leagues:
-                async with PolymarketClient(auth) as client:
-                    tasks.append(
-                        market_refresh_loop(client, ws, leagues, products, subscribed)
-                    )
-                    await asyncio.gather(*tasks)
+                async with PolymarketClient(auth) as discovery_client:
+                    tasks.append(asyncio.create_task(
+                        market_refresh_loop(discovery_client, ws, leagues, products, subscribed),
+                        name="market_refresh",
+                    ))
+
+                    async def _shutdown_sequence() -> None:
+                        await shutdown_event.wait()
+                        logger.warning("Shutdown signal received, cancelling all open orders...", signal=shutdown_signal)
+                        try:
+                            cancelled = await asyncio.wait_for(
+                                components.executor.cancel_all_orders(),
+                                timeout=10.0,
+                            )
+                            logger.warning("Cancel all orders complete", cancelled=cancelled)
+                        except asyncio.TimeoutError:
+                            logger.error("Timeout cancelling open orders")
+                        except Exception as exc:
+                            logger.error("Failed cancelling open orders", error=str(exc))
+                        try:
+                            components.engine.stop()
+                        except Exception:
+                            pass
+                        try:
+                            await asyncio.wait_for(ws.disconnect(), timeout=5.0)
+                        except Exception:
+                            pass
+                        for t in tasks:
+                            if not t.done():
+                                t.cancel()
+
+                    shutdown_task = asyncio.create_task(_shutdown_sequence(), name="shutdown")
+                    try:
+                        done, pending = await asyncio.wait(
+                            [*tasks, shutdown_task],
+                            return_when=asyncio.FIRST_COMPLETED,
+                        )
+                        if not shutdown_event.is_set():
+                            shutdown_event.set()
+                        await shutdown_task
+                    finally:
+                        for t in tasks:
+                            t.cancel()
+                        await asyncio.gather(*tasks, return_exceptions=True)
+                        if discovery_client is not None:
+                            try:
+                                await discovery_client.close()
+                            except Exception:
+                                pass
+                        if live_client is not None:
+                            try:
+                                await live_client.close()
+                            except Exception:
+                                pass
             else:
-                await asyncio.gather(*tasks)
+                async def _shutdown_sequence() -> None:
+                    await shutdown_event.wait()
+                    logger.warning("Shutdown signal received, cancelling all open orders...", signal=shutdown_signal)
+                    try:
+                        cancelled = await asyncio.wait_for(
+                            components.executor.cancel_all_orders(),
+                            timeout=10.0,
+                        )
+                        logger.warning("Cancel all orders complete", cancelled=cancelled)
+                    except asyncio.TimeoutError:
+                        logger.error("Timeout cancelling open orders")
+                    except Exception as exc:
+                        logger.error("Failed cancelling open orders", error=str(exc))
+                    try:
+                        components.engine.stop()
+                    except Exception:
+                        pass
+                    try:
+                        await asyncio.wait_for(ws.disconnect(), timeout=5.0)
+                    except Exception:
+                        pass
+                    for t in tasks:
+                        if not t.done():
+                            t.cancel()
+
+                shutdown_task = asyncio.create_task(_shutdown_sequence(), name="shutdown")
+                try:
+                    done, pending = await asyncio.wait(
+                        [*tasks, shutdown_task],
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    if not shutdown_event.is_set():
+                        shutdown_event.set()
+                    await shutdown_task
+                finally:
+                    for t in tasks:
+                        t.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+                    if live_client is not None:
+                        try:
+                            await live_client.close()
+                        except Exception:
+                            pass
 
 
 if __name__ == "__main__":
