@@ -1,16 +1,36 @@
 """
 Discord Monitoring Bot for Polymarket Trading Bot
 """
+import os
 import discord
 from discord.ext import commands, tasks
 import asyncio
 import aiohttp
 import subprocess
 from datetime import datetime, timezone
+from dotenv import load_dotenv
 
-BOT_TOKEN = "MTQ2NzYxNzg1NDIxMDk2OTg5NA.GdbJGd.nvbCA0BWj8l8NBWnbyHiIsmBgQsw9zcrFp5FeY"
-CHANNEL_ID = 1467618675619266656
-HEALTH_URL = "http://localhost:8080/health"
+load_dotenv()
+
+
+def _require_env(name: str) -> str:
+    value = os.getenv(name, "").strip()
+    if not value:
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return value
+
+
+def _require_env_int(name: str) -> int:
+    raw = _require_env(name)
+    try:
+        return int(raw)
+    except ValueError as e:
+        raise RuntimeError(f"Environment variable {name} must be an integer") from e
+
+
+BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "").strip()
+CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID", "0"))
+HEALTH_URL = os.getenv("DISCORD_HEALTH_URL", "http://localhost:8080/health").strip()
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -203,4 +223,8 @@ async def pnl_cmd(ctx):
         await ctx.send("❌ Bot offline")
 
 if __name__ == "__main__":
+    if not BOT_TOKEN:
+        BOT_TOKEN = _require_env("DISCORD_BOT_TOKEN")
+    if not CHANNEL_ID:
+        CHANNEL_ID = _require_env_int("DISCORD_CHANNEL_ID")
     bot.run(BOT_TOKEN)
