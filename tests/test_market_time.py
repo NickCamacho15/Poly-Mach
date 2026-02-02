@@ -21,11 +21,11 @@ def test_is_tradeable_slug_blocks_past_dates():
     assert is_tradeable_slug("aec-nba-dal-mil-2026-01-25", now, allow_in_game=True) is False
 
 
-def test_is_tradeable_slug_blocks_today_unless_allow_in_game():
+def test_is_tradeable_slug_allows_today():
     now = datetime.now(timezone.utc)
     today = now.date().isoformat()
     slug = f"aec-nba-dal-mil-{today}"
-    assert is_tradeable_slug(slug, now, allow_in_game=False) is False
+    assert is_tradeable_slug(slug, now, allow_in_game=False) is True
     assert is_tradeable_slug(slug, now, allow_in_game=True) is True
 
 

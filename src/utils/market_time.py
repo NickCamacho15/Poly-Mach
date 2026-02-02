@@ -39,8 +39,7 @@ def is_tradeable_slug(slug: str, now_utc: datetime, *, allow_in_game: bool) -> b
     Rules:
     - If no parseable date -> allow (unknown/non-sports slug format).
     - If date < today (UTC) -> block.
-    - If date == today (UTC) -> allow only if allow_in_game=True.
-    - If date > today (UTC) -> allow.
+    - If date >= today (UTC) -> allow.
     """
     if now_utc.tzinfo is None:
         now_utc = now_utc.replace(tzinfo=timezone.utc)
@@ -52,7 +51,5 @@ def is_tradeable_slug(slug: str, now_utc: datetime, *, allow_in_game: bool) -> b
     today = now_utc.date()
     if slug_dt < today:
         return False
-    if slug_dt == today:
-        return bool(allow_in_game)
     return True
 
