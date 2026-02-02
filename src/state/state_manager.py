@@ -629,6 +629,25 @@ class StateManager:
             market_slug = data.get("marketSlug")
             if not market_slug:
                 return
+
+            def _parse_decimal(raw: Any) -> Optional[Decimal]:
+                if raw is None:
+                    return None
+                try:
+                    # Some payloads use {"value": "..."} objects for price.
+                    if isinstance(raw, dict) and "value" in raw:
+                        raw = raw.get("value")
+                    return Decimal(str(raw))
+                except Exception:
+                    return None
+
+            def _parse_int(raw: Any) -> Optional[int]:
+                if raw is None:
+                    return None
+                try:
+                    return int(Decimal(str(raw)))
+                except Exception:
+                    return None
             
             def _parse_price_levels(levels: Any) -> List[tuple[Decimal, int]]:
                 """
@@ -691,6 +710,15 @@ class StateManager:
             else:
                 yes_data = yes_data or {}
                 no_data = no_data or {}
+
+            # Fast path: some MARKET_DATA payloads include top-of-book fields
+            # (yesBid/yesAsk/noBid/noAsk) rather than full depth arrays.
+            direct_yes_bid = _parse_decimal(data.get("yesBid", data.get("yes_bid")))
+            direct_yes_ask = _parse_decimal(data.get("yesAsk", data.get("yes_ask")))
+            direct_no_bid = _parse_decimal(data.get("noBid", data.get("no_bid")))
+            direct_no_ask = _parse_decimal(data.get("noAsk", data.get("no_ask")))
+            direct_yes_bid_size = _parse_int(data.get("yesBidSize", data.get("yes_bid_size")))
+            direct_yes_ask_size = _parse_int(data.get("yesAskSize", data.get("yes_ask_size")))
             
             # Parse YES side
             yes_bids = yes_data.get("bids", [])
@@ -704,12 +732,18 @@ class StateManager:
             parsed_yes_bids = _parse_price_levels(yes_bids)
             parsed_yes_asks = _parse_price_levels(yes_asks)
 
-            if parsed_yes_bids:
+            if direct_yes_bid is not None:
+                yes_bid = direct_yes_bid
+                yes_bid_size = direct_yes_bid_size or 0
+            elif parsed_yes_bids:
                 best_bid_price, best_bid_qty = max(parsed_yes_bids, key=lambda x: x[0])
                 yes_bid = best_bid_price
                 yes_bid_size = best_bid_qty
             
-            if parsed_yes_asks:
+            if direct_yes_ask is not None:
+                yes_ask = direct_yes_ask
+                yes_ask_size = direct_yes_ask_size or 0
+            elif parsed_yes_asks:
                 best_ask_price, best_ask_qty = min(parsed_yes_asks, key=lambda x: x[0])
                 yes_ask = best_ask_price
                 yes_ask_size = best_ask_qty
@@ -724,10 +758,14 @@ class StateManager:
             parsed_no_bids = _parse_price_levels(no_bids)
             parsed_no_asks = _parse_price_levels(no_asks)
 
-            if parsed_no_bids:
+            if direct_no_bid is not None:
+                no_bid = direct_no_bid
+            elif parsed_no_bids:
                 no_bid, _ = max(parsed_no_bids, key=lambda x: x[0])
             
-            if parsed_no_asks:
+            if direct_no_ask is not None:
+                no_ask = direct_no_ask
+            elif parsed_no_asks:
                 no_ask, _ = min(parsed_no_asks, key=lambda x: x[0])
             
             # Update state

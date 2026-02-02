@@ -680,9 +680,10 @@ def create_orderbook_handler(tracker: OrderBookTracker):
         if not market_slug:
             return
 
-        # Live feeds may emit top-level "bids" + "offers" rather than nested
-        # {"yes": {"bids": ..., "asks": ...}, "no": ...}. Normalize to the
-        # tracker format so best bid/ask populate correctly.
+        # Live feeds may emit:
+        # - top-level "bids"/"offers" rather than nested {"yes": {"bids":..., "asks":...}}
+        # - top-of-book scalars like yesBid/yesAsk/noBid/noAsk rather than full depth arrays
+        # Normalize to the tracker format so best bid/ask populate correctly.
         normalized = data
         if "yes" not in data and ("bids" in data or "offers" in data):
             normalized = dict(data)
@@ -691,6 +692,43 @@ def create_orderbook_handler(tracker: OrderBookTracker):
                 "asks": data.get("offers", []),
             }
             normalized.setdefault("no", {"bids": [], "asks": []})
+        elif "yes" not in data and (
+            "yesBid" in data
+            or "yesAsk" in data
+            or "noBid" in data
+            or "noAsk" in data
+            or "yes_bid" in data
+            or "yes_ask" in data
+            or "no_bid" in data
+            or "no_ask" in data
+        ):
+            # Synthesize a one-level book from top-of-book fields.
+            def _px(raw):
+                if raw is None:
+                    return None
+                if isinstance(raw, dict) and "value" in raw:
+                    return raw.get("value")
+                return raw
+
+            yes_bid = _px(data.get("yesBid", data.get("yes_bid")))
+            yes_ask = _px(data.get("yesAsk", data.get("yes_ask")))
+            no_bid = _px(data.get("noBid", data.get("no_bid")))
+            no_ask = _px(data.get("noAsk", data.get("no_ask")))
+
+            yes_bid_size = data.get("yesBidSize", data.get("yes_bid_size", 0))
+            yes_ask_size = data.get("yesAskSize", data.get("yes_ask_size", 0))
+            no_bid_size = data.get("noBidSize", data.get("no_bid_size", 0))
+            no_ask_size = data.get("noAskSize", data.get("no_ask_size", 0))
+
+            normalized = dict(data)
+            normalized["yes"] = {
+                "bids": [[yes_bid, yes_bid_size]] if yes_bid is not None else [],
+                "asks": [[yes_ask, yes_ask_size]] if yes_ask is not None else [],
+            }
+            normalized["no"] = {
+                "bids": [[no_bid, no_bid_size]] if no_bid is not None else [],
+                "asks": [[no_ask, no_ask_size]] if no_ask is not None else [],
+            }
 
         await tracker.update_async(
             market_slug=market_slug,
