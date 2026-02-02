@@ -292,7 +292,19 @@ class PolymarketClient:
         Returns:
             Balance object with available and total balance
         """
-        data = await self._request("GET", "/v1/account/balance")
+        data = await self._request("GET", "/v1/account/balances")
+        balances = data.get("balances", [])
+        if isinstance(balances, list) and balances:
+            # Prefer USD if present; otherwise take the first entry.
+            entry = None
+            for b in balances:
+                if isinstance(b, dict) and str(b.get("currency", "")).upper() == "USD":
+                    entry = b
+                    break
+            if entry is None:
+                entry = balances[0] if isinstance(balances[0], dict) else {}
+            return Balance.model_validate(entry)
+        # Fallback: some environments may return a flat object
         return Balance.model_validate(data)
     
     # =========================================================================

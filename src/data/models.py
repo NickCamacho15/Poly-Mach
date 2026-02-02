@@ -266,9 +266,19 @@ class Balance(BaseModel):
     """Account balance information."""
     model_config = ConfigDict(populate_by_name=True)
     
-    available_balance: Decimal = Field(alias="availableBalance")
-    total_balance: Optional[Decimal] = Field(default=None, alias="totalBalance")
-    currency: str = "USD"
+    # Polymarket has used multiple schemas:
+    # - legacy: {"availableBalance": "...", "totalBalance": "...", "currency": "USD"}
+    # - current: {"currentBalance": 1000.0, "buyingPower": 850.0, "currency": "USD", ...}
+    #
+    # We treat buyingPower as the cash available for placing new orders.
+    available_balance: Decimal = Field(
+        validation_alias=AliasChoices("availableBalance", "buyingPower")
+    )
+    total_balance: Optional[Decimal] = Field(
+        default=None,
+        validation_alias=AliasChoices("totalBalance", "currentBalance"),
+    )
+    currency: str = Field(default="USD", validation_alias=AliasChoices("currency",))
 
 
 # =============================================================================

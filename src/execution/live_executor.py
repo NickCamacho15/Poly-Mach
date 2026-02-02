@@ -442,7 +442,13 @@ class LiveExecutor:
         async def handler(data: Dict[str, Any]) -> None:
             if data.get("type") != "ACCOUNT_BALANCE_UPDATE":
                 return
-            raw = data.get("availableBalance") or data.get("balance")
+            # Prefer buyingPower (available cash for new orders).
+            raw = (
+                data.get("buyingPower")
+                or data.get("availableBalance")
+                or data.get("balance")
+                or data.get("currentBalance")
+            )
             if raw is None:
                 return
             try:

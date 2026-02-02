@@ -33,7 +33,7 @@ class PolymarketAuth:
         ...     api_key_id="your-api-key-uuid",
         ...     private_key_base64="your-base64-private-key"
         ... )
-        >>> headers = auth.sign_request("GET", "/v1/account/balance")
+        >>> headers = auth.sign_request("GET", "/v1/account/balances")
     """
     
     def __init__(self, api_key_id: str, private_key_base64: str):
@@ -116,7 +116,7 @@ class PolymarketAuth:
             - Content-Type
             
         Example:
-            >>> headers = auth.sign_request("GET", "/v1/account/balance")
+            >>> headers = auth.sign_request("GET", "/v1/account/balances")
             >>> response = requests.get(url, headers=headers)
         """
         if timestamp is None:
