@@ -324,6 +324,9 @@ class PolymarketClient:
             raw_positions = data["data"].get("positions")
         if raw_positions is None and isinstance(data.get("portfolio"), dict):
             raw_positions = data["portfolio"].get("positions")
+        # Observed in the wild: payload includes `availablePositions` alongside `positions`.
+        # If `positions` is empty or not usable, fall back to availablePositions.
+        raw_available = data.get("availablePositions")
 
         positions_list: List[Dict[str, Any]] = []
         if isinstance(raw_positions, list):
@@ -333,7 +336,8 @@ class PolymarketClient:
                 elif isinstance(item, dict):
                     positions_list.append(item)
         elif isinstance(raw_positions, dict):
-            # Sometimes wrapped as {"items": [...]} or similar
+            # Documented schema: positions is a map of {marketSlug -> positionObj}
+            # (not an array). Also sometimes wrapped as {"items": [...]}.
             items = raw_positions.get("items") if isinstance(raw_positions.get("items"), list) else None
             if items:
                 for item in items:
@@ -341,6 +345,30 @@ class PolymarketClient:
                         positions_list.append(item["position"])
                     elif isinstance(item, dict):
                         positions_list.append(item)
+            else:
+                for slug, pos in raw_positions.items():
+                    if not isinstance(pos, dict):
+                        continue
+                    # Preserve the map key as a hint for downstream parsing.
+                    if "marketSlug" not in pos and "market_slug" not in pos and "slug" not in pos:
+                        pos = {**pos, "marketSlug": str(slug)}
+                    positions_list.append(pos)
+
+        # Fallback: use availablePositions when positions is empty/missing.
+        if not positions_list:
+            if isinstance(raw_available, list):
+                for item in raw_available:
+                    if isinstance(item, dict) and isinstance(item.get("position"), dict):
+                        positions_list.append(item["position"])
+                    elif isinstance(item, dict):
+                        positions_list.append(item)
+            elif isinstance(raw_available, dict):
+                for slug, pos in raw_available.items():
+                    if not isinstance(pos, dict):
+                        continue
+                    if "marketSlug" not in pos and "market_slug" not in pos and "slug" not in pos:
+                        pos = {**pos, "marketSlug": str(slug)}
+                    positions_list.append(pos)
 
         # If we still have nothing, log keys to help diagnose schema drift.
         if not positions_list:
@@ -348,10 +376,32 @@ class PolymarketClient:
                 "Positions response did not contain parsable positions",
                 top_level_keys=list(data.keys())[:25] if isinstance(data, dict) else None,
             )
-            # Log a compact sample for debugging (avoid huge payloads).
+            # Log compact shape info at warning level (so it shows up in prod).
             if isinstance(data, dict):
-                sample = {k: data.get(k) for k in list(data.keys())[:10]}
-                logger.debug("Positions response sample", sample=sample)
+                pos_type = type(data.get("positions")).__name__
+                pos_len = len(data.get("positions")) if isinstance(data.get("positions"), list) else None
+                avail_type = type(data.get("availablePositions")).__name__
+                avail_len = len(data.get("availablePositions")) if isinstance(data.get("availablePositions"), list) else None
+                logger.warning(
+                    "Positions response shape",
+                    positions_type=pos_type,
+                    positions_len=pos_len,
+                    available_positions_type=avail_type,
+                    available_positions_len=avail_len,
+                )
+                # Sample first element keys (if any)
+                if isinstance(data.get("positions"), list) and data["positions"]:
+                    first = data["positions"][0]
+                    logger.warning(
+                        "Positions[0] sample",
+                        keys=list(first.keys())[:25] if isinstance(first, dict) else None,
+                    )
+                if isinstance(data.get("availablePositions"), list) and data["availablePositions"]:
+                    first = data["availablePositions"][0]
+                    logger.warning(
+                        "availablePositions[0] sample",
+                        keys=list(first.keys())[:25] if isinstance(first, dict) else None,
+                    )
 
         parsed: List[Position] = []
         for p in positions_list:

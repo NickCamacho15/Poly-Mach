@@ -342,6 +342,8 @@ async def main() -> None:
             "Auto-discovery enabled",
             leagues=[l.value for l in leagues],
             products=[p.value for p in products] if products else "all",
+            enable_live_arbitrage=bool(settings.enable_live_arbitrage),
+            enable_statistical_edge=bool(settings.enable_statistical_edge),
         )
         
         async with PolymarketClient(auth) as client:

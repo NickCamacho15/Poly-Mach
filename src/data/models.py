@@ -10,7 +10,7 @@ from decimal import Decimal
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
 # =============================================================================
@@ -256,6 +256,102 @@ class Position(BaseModel):
     unrealized_pnl_percent: Optional[Decimal] = Field(
         default=None, validation_alias=AliasChoices("unrealizedPnlPercent", "percentPnl")
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_portfolio_positions_schema(cls, data: Any) -> Any:
+        """
+        Normalize Polymarket's GET /v1/portfolio/positions schema into our simpler Position shape.
+
+        Docs indicate:
+        - positions is a map {marketSlug -> positionObj}
+        - fields include netPosition, qtyBought, qtySold, cost{value}, cashValue{value}, marketMetadata{slug,outcome}
+        """
+        if not isinstance(data, dict):
+            return data
+
+        # If this already looks like our internal shape, don't touch it.
+        if any(k in data for k in ("avgPrice", "avg_price", "averagePrice")) and any(k in data for k in ("quantity", "size", "qty")):
+            return data
+
+        if "netPosition" not in data and "marketMetadata" not in data:
+            return data
+
+        md = data.get("marketMetadata") if isinstance(data.get("marketMetadata"), dict) else {}
+        slug = (
+            md.get("slug")
+            or data.get("marketSlug")
+            or data.get("market_slug")
+            or data.get("slug")
+            or data.get("market")
+        )
+
+        outcome = (md.get("outcome") or data.get("outcome") or data.get("side") or "").strip()
+        outcome_upper = outcome.upper()
+        side: Optional[str] = None
+        if outcome_upper in ("YES", "Y"):
+            side = "YES"
+        elif outcome_upper in ("NO", "N"):
+            side = "NO"
+
+        def _dec(v: Any) -> Optional[Decimal]:
+            if v is None:
+                return None
+            try:
+                return Decimal(str(v))
+            except Exception:
+                return None
+
+        def _int(v: Any) -> Optional[int]:
+            if v is None:
+                return None
+            try:
+                return int(Decimal(str(v)))
+            except Exception:
+                try:
+                    return int(v)
+                except Exception:
+                    return None
+
+        net = _int(data.get("netPosition")) or 0
+        qty_bought = _int(data.get("qtyBought"))
+        qty_sold = _int(data.get("qtySold"))
+
+        cost_obj = data.get("cost") if isinstance(data.get("cost"), dict) else {}
+        cash_obj = data.get("cashValue") if isinstance(data.get("cashValue"), dict) else {}
+        cost_value = _dec(cost_obj.get("value")) or Decimal("0")
+        cash_value = _dec(cash_obj.get("value"))
+
+        qty_for_avg = (qty_bought or 0) if (qty_bought or 0) > 0 else abs(net)
+        avg_price = (cost_value / Decimal(qty_for_avg)) if qty_for_avg > 0 else Decimal("0")
+
+        # If net is negative, treat it as the opposite side exposure for our simplified model.
+        if net < 0 and side in ("YES", "NO"):
+            side = "NO" if side == "YES" else "YES"
+
+        quantity = abs(net)
+        current_value = cash_value
+        unrealized_pnl = (cash_value - cost_value) if cash_value is not None else None
+        unrealized_pnl_percent = (
+            (unrealized_pnl / cost_value) if (unrealized_pnl is not None and cost_value != 0) else None
+        )
+        current_price = (cash_value / Decimal(quantity)) if (cash_value is not None and quantity > 0) else None
+
+        normalized: Dict[str, Any] = {
+            "marketSlug": slug,
+            "side": side or outcome_upper or "YES",
+            "quantity": quantity,
+            "avgPrice": str(avg_price),
+            "currentValue": str(current_value) if current_value is not None else None,
+            "unrealizedPnl": str(unrealized_pnl) if unrealized_pnl is not None else None,
+            "unrealizedPnlPercent": str(unrealized_pnl_percent) if unrealized_pnl_percent is not None else None,
+            "currentPrice": str(current_price) if current_price is not None else None,
+        }
+
+        # Keep original fields around (helpful for debugging, ignored by model_config extra=ignore elsewhere).
+        # But since this model doesn't set extra=ignore, we avoid attaching raw fields directly.
+        # Callers that need raw can log the raw payload.
+        return normalized
 
     @field_validator("quantity", mode="before")
     @classmethod

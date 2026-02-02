@@ -316,6 +316,35 @@ class TestDataModels:
         assert position.side == Side.YES
         assert position.quantity == 100
         assert position.cost_basis == Decimal("45")
+
+    def test_position_model_portfolio_positions_schema(self):
+        """Test Position normalization for GET /v1/portfolio/positions schema (map values)."""
+        from src.data.models import Position, Side
+
+        data = {
+            "netPosition": "100",
+            "qtyBought": "100",
+            "qtySold": "0",
+            "cost": {"value": "60.00", "currency": "USD"},
+            "cashValue": {"value": "65.00", "currency": "USD"},
+            "qtyAvailable": "100",
+            "expired": False,
+            "updateTime": "2024-01-15T10:30:00Z",
+            "marketMetadata": {
+                "slug": "will-x-happen",
+                "title": "Will X happen?",
+                "outcome": "Yes",
+            },
+        }
+
+        position = Position.model_validate(data)
+
+        assert position.market_slug == "will-x-happen"
+        assert position.side == Side.YES
+        assert position.quantity == 100
+        assert position.avg_price == Decimal("0.6")
+        assert position.current_value == Decimal("65.00")
+        assert position.unrealized_pnl == Decimal("5.00")
     
     def test_balance_model(self):
         """Test Balance model parsing."""
