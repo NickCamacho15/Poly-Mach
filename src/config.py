@@ -104,6 +104,27 @@ class Settings(BaseSettings):
         env="LIVE_RECONCILE_INTERVAL_SECONDS",
     )
 
+    # Market data fallback (REST polling)
+    #
+    # If Polymarket's market-data websocket is quiet (or blocked), the bot can
+    # optionally poll REST orderbook endpoints to keep prices fresh.
+    enable_rest_orderbook_polling: bool = Field(
+        default=False,
+        env="ENABLE_REST_ORDERBOOK_POLLING",
+    )
+    rest_orderbook_poll_interval_seconds: float = Field(
+        default=5.0,
+        env="REST_ORDERBOOK_POLL_INTERVAL_SECONDS",
+    )
+    rest_orderbook_max_markets: int = Field(
+        default=50,
+        env="REST_ORDERBOOK_MAX_MARKETS",
+    )
+    rest_orderbook_concurrency: int = Field(
+        default=5,
+        env="REST_ORDERBOOK_CONCURRENCY",
+    )
+
     # Live arbitrage strategy tuning
     live_arb_min_edge: Decimal = Field(default=Decimal("0.03"), env="LIVE_ARB_MIN_EDGE")
     live_arb_order_size: Decimal = Field(default=Decimal("10.00"), env="LIVE_ARB_ORDER_SIZE")

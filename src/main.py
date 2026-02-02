@@ -19,6 +19,7 @@ from src.config import Settings, settings
 from src.data.event_bus import EventBus
 from src.data.market_discovery import League, MarketDiscovery, MarketProduct
 from src.data.orderbook import OrderBookTracker, create_orderbook_handler
+from src.data.rest_orderbook_poller import RestOrderbookPoller
 from src.data.odds_feed import MockOddsFeed
 from src.data.sports_feed import MockSportsFeed
 from src.execution.paper_executor import PaperExecutor
@@ -381,9 +382,13 @@ async def main() -> None:
         ws_private = PolymarketWebSocket(auth, base_url=settings.pm_ws_url)
 
     # Wire handlers in order: state updates -> order book -> strategy engine.
-    ws.on("MARKET_DATA", components.state_manager.create_market_handler())
-    ws.on("MARKET_DATA", create_orderbook_handler(components.orderbook))
-    ws.on("MARKET_DATA", components.engine.create_market_handler())
+    state_handler = components.state_manager.create_market_handler()
+    orderbook_handler = create_orderbook_handler(components.orderbook)
+    engine_handler = components.engine.create_market_handler()
+
+    ws.on("MARKET_DATA", state_handler)
+    ws.on("MARKET_DATA", orderbook_handler)
+    ws.on("MARKET_DATA", engine_handler)
 
     # Live mode: also subscribe to private updates (fills/positions/balance).
     if ws_private is not None and settings.trading_mode == "live":
@@ -448,6 +453,20 @@ async def main() -> None:
                         name="health_server",
                     ),
                 ]
+
+                # Optional: REST fallback polling for orderbooks (feeds the same handlers as WS)
+                if settings.enable_rest_orderbook_polling:
+                    # Prefer the live_client if present so shutdown cleanup closes it.
+                    rest_client = live_client or PolymarketClient(auth=auth)
+                    poller = RestOrderbookPoller(
+                        client=rest_client,
+                        market_slugs=market_slugs,
+                        handlers=[state_handler, orderbook_handler, engine_handler],
+                        interval_seconds=settings.rest_orderbook_poll_interval_seconds,
+                        max_markets=settings.rest_orderbook_max_markets,
+                        concurrency=settings.rest_orderbook_concurrency,
+                    )
+                    tasks.append(asyncio.create_task(poller.run(), name="rest_orderbook_poller"))
 
                 # Optional feed tasks for live strategies (mock by default)
                 if settings.enable_live_arbitrage or settings.enable_statistical_edge:
@@ -618,6 +637,19 @@ async def main() -> None:
                     name="health_server",
                 ),
             ]
+
+            # Optional: REST fallback polling for orderbooks (feeds the same handlers as WS)
+            if settings.enable_rest_orderbook_polling:
+                rest_client = live_client or PolymarketClient(auth=auth)
+                poller = RestOrderbookPoller(
+                    client=rest_client,
+                    market_slugs=market_slugs,
+                    handlers=[state_handler, orderbook_handler, engine_handler],
+                    interval_seconds=settings.rest_orderbook_poll_interval_seconds,
+                    max_markets=settings.rest_orderbook_max_markets,
+                    concurrency=settings.rest_orderbook_concurrency,
+                )
+                tasks.append(asyncio.create_task(poller.run(), name="rest_orderbook_poller"))
 
             # Optional feed tasks for live strategies (mock by default)
             if settings.enable_live_arbitrage or settings.enable_statistical_edge:
