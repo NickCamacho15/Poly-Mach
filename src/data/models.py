@@ -10,7 +10,7 @@ from decimal import Decimal
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_validator
 
 
 # =============================================================================
@@ -245,16 +245,37 @@ class Position(BaseModel):
     """Position in a market."""
     model_config = ConfigDict(populate_by_name=True)
     
-    market_slug: str = Field(alias="marketSlug")
-    side: Side
-    quantity: int
-    avg_price: Decimal = Field(alias="avgPrice")
-    current_price: Optional[Decimal] = Field(default=None, alias="currentPrice")
-    current_value: Optional[Decimal] = Field(default=None, alias="currentValue")
-    unrealized_pnl: Optional[Decimal] = Field(default=None, alias="unrealizedPnl")
+    # Positions response may vary; accept common aliases.
+    market_slug: str = Field(validation_alias=AliasChoices("marketSlug", "market_slug", "slug", "market"))
+    side: Side = Field(validation_alias=AliasChoices("side", "outcome"))
+    quantity: int = Field(validation_alias=AliasChoices("quantity", "size", "qty"))
+    avg_price: Decimal = Field(validation_alias=AliasChoices("avgPrice", "avg_price", "averagePrice"))
+    current_price: Optional[Decimal] = Field(default=None, validation_alias=AliasChoices("currentPrice", "curPrice"))
+    current_value: Optional[Decimal] = Field(default=None, validation_alias=AliasChoices("currentValue", "assetNotional"))
+    unrealized_pnl: Optional[Decimal] = Field(default=None, validation_alias=AliasChoices("unrealizedPnl", "cashPnl"))
     unrealized_pnl_percent: Optional[Decimal] = Field(
-        default=None, alias="unrealizedPnlPercent"
+        default=None, validation_alias=AliasChoices("unrealizedPnlPercent", "percentPnl")
     )
+
+    @field_validator("quantity", mode="before")
+    @classmethod
+    def _coerce_quantity(cls, v: Any) -> int:
+        if v is None:
+            return 0
+        try:
+            return int(Decimal(str(v)))
+        except Exception:
+            return int(v)
+
+    @field_validator("avg_price", "current_price", "current_value", "unrealized_pnl", "unrealized_pnl_percent", mode="before")
+    @classmethod
+    def _coerce_decimal(cls, v: Any) -> Any:
+        if v is None:
+            return None
+        try:
+            return Decimal(str(v))
+        except Exception:
+            return v
     
     @property
     def cost_basis(self) -> Decimal:

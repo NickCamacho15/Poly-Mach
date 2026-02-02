@@ -148,6 +148,18 @@ async def discover_markets(
             total_after=len(filtered_slugs),
             allow_in_game=allow_in_game,
         )
+
+    # Safety: if we filtered everything out (often after midnight UTC) and we're not
+    # explicitly allowing in-game, fall back to subscribing to today's markets so
+    # the bot doesn't crash-loop on "No markets found". Trading is still gated at
+    # execution time by StrategyEngine unless signals opt into allow_in_game.
+    if not filtered_slugs and slugs and not allow_in_game:
+        logger.warning(
+            "No markets after slug-date filtering; falling back to allow_in_game=True for subscriptions",
+            total_before=len(slugs),
+        )
+        filtered_slugs = [s for s in slugs if is_tradeable_slug(s, now, allow_in_game=True)]
+
     slugs = filtered_slugs
     logger.info(
         "Discovered markets",
@@ -333,12 +345,8 @@ async def main() -> None:
         )
         
         async with PolymarketClient(auth) as client:
-            # IMPORTANT: Subscribe to "today" markets even if we won't trade them.
-            # The StrategyEngine has a stricter pre-trade gate that blocks order
-            # placement on today-date slugs unless a signal opts into allow_in_game.
-            # If we filter too aggressively here, the bot can end up with 0 markets
-            # after midnight UTC and crash-loop.
-            market_slugs = await discover_markets(client, leagues, products, allow_in_game=True)
+            allow_in_game = bool(settings.enable_live_arbitrage or settings.enable_statistical_edge)
+            market_slugs = await discover_markets(client, leagues, products, allow_in_game=allow_in_game)
         
         if not market_slugs:
             logger.error("No markets found for configured leagues")
@@ -456,7 +464,7 @@ async def main() -> None:
                                 leagues,
                                 products,
                                 subscribed,
-                                allow_in_game=True,
+                                allow_in_game=bool(settings.enable_live_arbitrage or settings.enable_statistical_edge),
                             ),
                             name="market_refresh",
                         ))
@@ -626,7 +634,7 @@ async def main() -> None:
                             leagues,
                             products,
                             subscribed,
-                            allow_in_game=True,
+                            allow_in_game=bool(settings.enable_live_arbitrage or settings.enable_statistical_edge),
                         ),
                         name="market_refresh",
                     ))

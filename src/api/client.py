@@ -319,8 +319,51 @@ class PolymarketClient:
             List of Position objects
         """
         data = await self._request("GET", "/v1/portfolio/positions")
-        positions = data.get("positions", [])
-        return [Position.model_validate(p) for p in positions]
+        raw_positions = data.get("positions")
+        if raw_positions is None and isinstance(data.get("data"), dict):
+            raw_positions = data["data"].get("positions")
+        if raw_positions is None and isinstance(data.get("portfolio"), dict):
+            raw_positions = data["portfolio"].get("positions")
+
+        positions_list: List[Dict[str, Any]] = []
+        if isinstance(raw_positions, list):
+            for item in raw_positions:
+                if isinstance(item, dict) and isinstance(item.get("position"), dict):
+                    positions_list.append(item["position"])
+                elif isinstance(item, dict):
+                    positions_list.append(item)
+        elif isinstance(raw_positions, dict):
+            # Sometimes wrapped as {"items": [...]} or similar
+            items = raw_positions.get("items") if isinstance(raw_positions.get("items"), list) else None
+            if items:
+                for item in items:
+                    if isinstance(item, dict) and isinstance(item.get("position"), dict):
+                        positions_list.append(item["position"])
+                    elif isinstance(item, dict):
+                        positions_list.append(item)
+
+        # If we still have nothing, log keys to help diagnose schema drift.
+        if not positions_list:
+            logger.warning(
+                "Positions response did not contain parsable positions",
+                top_level_keys=list(data.keys())[:25] if isinstance(data, dict) else None,
+            )
+            # Log a compact sample for debugging (avoid huge payloads).
+            if isinstance(data, dict):
+                sample = {k: data.get(k) for k in list(data.keys())[:10]}
+                logger.debug("Positions response sample", sample=sample)
+
+        parsed: List[Position] = []
+        for p in positions_list:
+            try:
+                parsed.append(Position.model_validate(p))
+            except Exception as exc:
+                logger.warning(
+                    "Failed to parse position",
+                    error=str(exc),
+                    keys=list(p.keys())[:25] if isinstance(p, dict) else None,
+                )
+        return parsed
     
     async def get_activity(self, limit: int = 100) -> List[Dict[str, Any]]:
         """
