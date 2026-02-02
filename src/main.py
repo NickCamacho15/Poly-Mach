@@ -333,8 +333,12 @@ async def main() -> None:
         )
         
         async with PolymarketClient(auth) as client:
-            allow_in_game = bool(settings.enable_live_arbitrage or settings.enable_statistical_edge)
-            market_slugs = await discover_markets(client, leagues, products, allow_in_game=allow_in_game)
+            # IMPORTANT: Subscribe to "today" markets even if we won't trade them.
+            # The StrategyEngine has a stricter pre-trade gate that blocks order
+            # placement on today-date slugs unless a signal opts into allow_in_game.
+            # If we filter too aggressively here, the bot can end up with 0 markets
+            # after midnight UTC and crash-loop.
+            market_slugs = await discover_markets(client, leagues, products, allow_in_game=True)
         
         if not market_slugs:
             logger.error("No markets found for configured leagues")
@@ -452,7 +456,7 @@ async def main() -> None:
                                 leagues,
                                 products,
                                 subscribed,
-                                allow_in_game=bool(settings.enable_live_arbitrage or settings.enable_statistical_edge),
+                                allow_in_game=True,
                             ),
                             name="market_refresh",
                         ))
@@ -622,7 +626,7 @@ async def main() -> None:
                             leagues,
                             products,
                             subscribed,
-                            allow_in_game=bool(settings.enable_live_arbitrage or settings.enable_statistical_edge),
+                            allow_in_game=True,
                         ),
                         name="market_refresh",
                     ))
