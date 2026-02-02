@@ -31,6 +31,8 @@ def configure_logging(
         handlers.append(logging.FileHandler(log_path))
 
     logging.basicConfig(level=level, handlers=handlers, format="%(message)s")
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
     processors = [
         structlog.processors.TimeStamper(fmt="iso"),

@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     # Trading
     trading_mode: str = Field(default="paper", env="TRADING_MODE")  # "paper" or "live"
     initial_balance: Decimal = Field(default=Decimal("1000.00"), env="INITIAL_BALANCE")
+    tick_interval: float = Field(default=1.0, env="TICK_INTERVAL")
     
     # Market Selection
     # Option 1: Manual - set specific market slugs (comma-separated)
@@ -76,14 +77,32 @@ class Settings(BaseSettings):
     discord_webhook: str = ""
 
     # Strategy enable flags
+    enable_market_maker: bool = Field(default=True, env="ENABLE_MARKET_MAKER")
     enable_live_arbitrage: bool = Field(default=False, env="ENABLE_LIVE_ARBITRAGE")
     enable_statistical_edge: bool = Field(default=False, env="ENABLE_STATISTICAL_EDGE")
 
+    # Market maker tuning
+    market_maker_order_size: Decimal = Field(
+        default=Decimal("10.00"),
+        env="MARKET_MAKER_ORDER_SIZE_USD",
+    )
+    market_maker_spread: Decimal = Field(
+        default=Decimal("0.02"),
+        env="MARKET_MAKER_SPREAD",
+    )
+
     # Feed configuration (mock by default)
     use_mock_feeds: bool = Field(default=True, env="USE_MOCK_FEEDS")
+    allow_mock_feeds_in_live: bool = Field(default=False, env="ALLOW_MOCK_FEEDS_IN_LIVE")
     mock_sports_interval: float = Field(default=2.0, env="MOCK_SPORTS_INTERVAL")
     mock_odds_interval: float = Field(default=3.0, env="MOCK_ODDS_INTERVAL")
     feed_stale_seconds: int = Field(default=60, env="FEED_STALE_SECONDS")
+
+    # Live execution
+    live_reconcile_interval_seconds: float = Field(
+        default=10.0,
+        env="LIVE_RECONCILE_INTERVAL_SECONDS",
+    )
 
     # Live arbitrage strategy tuning
     live_arb_min_edge: Decimal = Field(default=Decimal("0.03"), env="LIVE_ARB_MIN_EDGE")

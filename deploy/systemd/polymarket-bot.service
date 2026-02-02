@@ -12,7 +12,7 @@ ExecStart=/home/ubuntu/polymarket-bot/venv/bin/python -m src.main
 Restart=always
 RestartSec=10
 TimeoutStopSec=30
-StandardOutput=append:/home/ubuntu/polymarket-bot/logs/bot.log
+# App logging can write to logs/bot.log via LOG_FILE; keep stdout in journald to avoid duplicates.
 StandardError=append:/home/ubuntu/polymarket-bot/logs/bot-error.log
 
 [Install]

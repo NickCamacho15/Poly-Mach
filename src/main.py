@@ -28,7 +28,7 @@ from src.execution.executor_protocol import ExecutorProtocol
 from src.risk.risk_manager import RiskConfig, RiskManager
 from src.state.state_manager import StateManager
 from src.strategies.live_arbitrage import LiveArbitrageConfig, LiveArbitrageStrategy
-from src.strategies.market_maker import MarketMakerStrategy
+from src.strategies.market_maker import MarketMakerConfig, MarketMakerStrategy
 from src.strategies.statistical_edge import StatisticalEdgeConfig, StatisticalEdgeStrategy
 from src.strategies.strategy_engine import StrategyEngine
 from src.utils.health import run_health_server
@@ -213,8 +213,16 @@ def build_components(app_settings: Settings, client: Optional[PolymarketClient] 
         orderbook=orderbook,
         executor=executor,
         risk_manager=risk_manager,
+        tick_interval=app_settings.tick_interval,
     )
-    engine.add_strategy(MarketMakerStrategy())
+    if app_settings.enable_market_maker:
+        market_maker_config = MarketMakerConfig(
+            order_size=app_settings.market_maker_order_size,
+            spread=app_settings.market_maker_spread,
+        )
+        engine.add_strategy(MarketMakerStrategy(config=market_maker_config))
+    else:
+        logger.warning("Market maker disabled via config")
 
     if app_settings.enable_live_arbitrage:
         live_config = LiveArbitrageConfig(
@@ -295,6 +303,19 @@ async def main() -> None:
 
     if not settings.pm_api_key_id or not settings.pm_private_key:
         logger.error("Missing API credentials; set PM_API_KEY_ID and PM_PRIVATE_KEY")
+        return
+
+    if (
+        settings.trading_mode == "live"
+        and settings.use_mock_feeds
+        and not settings.allow_mock_feeds_in_live
+        and (settings.enable_live_arbitrage or settings.enable_statistical_edge)
+    ):
+        logger.error(
+            "Mock feeds are disabled in live mode; set ALLOW_MOCK_FEEDS_IN_LIVE=true to override",
+            enable_live_arbitrage=settings.enable_live_arbitrage,
+            enable_statistical_edge=settings.enable_statistical_edge,
+        )
         return
 
     auth = PolymarketAuth(settings.pm_api_key_id, settings.pm_private_key)

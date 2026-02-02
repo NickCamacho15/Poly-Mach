@@ -179,8 +179,34 @@ class RiskManager:
         if qty <= 0:
             return RiskDecision(False, None, "Rejected: non-positive quantity")
 
-        # Apply Kelly sizing for BUY signals only if we have a probability estimate.
         sizing_info: Optional[Dict[str, Any]] = None
+        if signal.is_buy and price is not None:
+            available_cash = self.state.get_balance()
+            cash_buffer = Decimal("0.98")
+            max_affordable = (available_cash * cash_buffer) / price if price > 0 else Decimal("0")
+            max_affordable_qty = int(max_affordable)
+            if max_affordable_qty <= 0:
+                return RiskDecision(
+                    False,
+                    None,
+                    "Rejected: insufficient available cash",
+                    {
+                        "available_cash": float(available_cash),
+                        "price": float(price),
+                        "cash_buffer": float(cash_buffer),
+                    },
+                )
+            if qty > max_affordable_qty:
+                qty = max_affordable_qty
+                sizing_info = {
+                    **(sizing_info or {}),
+                    "reduced_for_cash": True,
+                    "available_cash": float(available_cash),
+                    "max_affordable_qty": max_affordable_qty,
+                    "cash_buffer": float(cash_buffer),
+                }
+
+        # Apply Kelly sizing for BUY signals only if we have a probability estimate.
         if signal.is_buy:
             true_prob = self._get_true_probability(signal)
             if true_prob is not None:
@@ -195,6 +221,7 @@ class RiskManager:
                 # Respect the strategy's maximum size if it already requested smaller.
                 qty = min(qty, result.contracts)
                 sizing_info = {
+                    **(sizing_info or {}),
                     "edge": float(result.edge),
                     "kelly_full": float(result.kelly_full),
                     "kelly_adjusted": float(result.kelly_adjusted),
@@ -237,7 +264,18 @@ class RiskManager:
                 limit_reason = "Portfolio exposure percent limit reached"
 
             if not check.allowed and max_additional <= 0:
-                return RiskDecision(False, None, f"Rejected: {check.reason}")
+                return RiskDecision(
+                    False,
+                    None,
+                    f"Rejected: {check.reason}",
+                    {
+                        "current_total_exposure": float(current_total_exposure),
+                        "equity": float(self._current_equity()),
+                        "max_portfolio_exposure_pct": float(self.config.max_portfolio_exposure_pct),
+                        "max_portfolio_exposure": float(self.config.max_portfolio_exposure),
+                        "max_by_pct": float(max_by_pct) if self.config.max_portfolio_exposure_pct > 0 else None,
+                    },
+                )
 
             if notional > max_additional:
                 # If we can reduce size, do so.
@@ -253,7 +291,18 @@ class RiskManager:
                         "max_additional_exposure": float(max_additional),
                     }
                 else:
-                    return RiskDecision(False, None, f"Rejected: {limit_reason}")
+                    return RiskDecision(
+                        False,
+                        None,
+                        f"Rejected: {limit_reason}",
+                        {
+                            "current_total_exposure": float(current_total_exposure),
+                            "equity": float(self._current_equity()),
+                            "max_portfolio_exposure_pct": float(self.config.max_portfolio_exposure_pct),
+                            "max_portfolio_exposure": float(self.config.max_portfolio_exposure),
+                            "max_by_pct": float(max_by_pct) if self.config.max_portfolio_exposure_pct > 0 else None,
+                        },
+                    )
 
             # Re-check min trade size after reduction.
             if notional < self.config.min_trade_size:

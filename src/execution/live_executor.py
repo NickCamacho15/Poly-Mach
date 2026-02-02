@@ -76,6 +76,15 @@ class LiveExecutor:
 
         logger.info("LiveExecutor initialized", initial_balance=float(self._initial_balance))
 
+    def _get_reconcile_interval(self) -> float:
+        if self.settings is None:
+            return 1.0
+        try:
+            interval = float(getattr(self.settings, "live_reconcile_interval_seconds", 1.0))
+        except Exception:
+            return 1.0
+        return max(interval, 1.0)
+
     async def initialize(self) -> None:
         """
         Perform an initial live state sync (balance/positions/open orders).
@@ -254,12 +263,31 @@ class LiveExecutor:
         # Note: this is conservative vs exchange behavior (which may allow partial fills).
         if is_buy and submit_order.order_type == OrderType.LIMIT and submit_order.price is not None:
             available = self.state.get_balance()
-            required = submit_order.price * submit_order.quantity
-            if required > available:
+            cash_buffer = Decimal("0.98")
+            max_affordable = (available * cash_buffer) / submit_order.price if submit_order.price > 0 else Decimal("0")
+            max_qty = int(max_affordable)
+            if max_qty <= 0:
+                required = submit_order.price * submit_order.quantity
                 return ExecutionResult(
                     order_id="",
                     status=OrderStatus.REJECTED,
                     error=f"Insufficient balance: need ${required:.2f}, have ${available:.2f}",
+                )
+            if submit_order.quantity > max_qty:
+                logger.info(
+                    "Resized order for available balance",
+                    requested_qty=submit_order.quantity,
+                    resized_qty=max_qty,
+                    available=float(available),
+                    price=float(submit_order.price),
+                )
+                submit_order = PaperOrderRequest(
+                    market_slug=submit_order.market_slug,
+                    intent=submit_order.intent,
+                    quantity=max_qty,
+                    price=submit_order.price,
+                    order_type=submit_order.order_type,
+                    post_only=submit_order.post_only,
                 )
 
         api_req = OrderRequest(
@@ -472,7 +500,7 @@ class LiveExecutor:
         now = datetime.now(timezone.utc)
         if not force and self._last_reconcile is not None:
             # Throttle to avoid hammering the API in tight loops.
-            if (now - self._last_reconcile.ts).total_seconds() < 1.0:
+            if (now - self._last_reconcile.ts).total_seconds() < self._get_reconcile_interval():
                 return []
 
         results: List[ExecutionResult] = []
