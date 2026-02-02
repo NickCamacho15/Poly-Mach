@@ -288,11 +288,6 @@ class Position(BaseModel):
 
         outcome = (md.get("outcome") or data.get("outcome") or data.get("side") or "").strip()
         outcome_upper = outcome.upper()
-        side: Optional[str] = None
-        if outcome_upper in ("YES", "Y"):
-            side = "YES"
-        elif outcome_upper in ("NO", "N"):
-            side = "NO"
 
         def _dec(v: Any) -> Optional[Decimal]:
             if v is None:
@@ -325,9 +320,17 @@ class Position(BaseModel):
         qty_for_avg = (qty_bought or 0) if (qty_bought or 0) > 0 else abs(net)
         avg_price = (cost_value / Decimal(qty_for_avg)) if qty_for_avg > 0 else Decimal("0")
 
-        # If net is negative, treat it as the opposite side exposure for our simplified model.
-        if net < 0 and side in ("YES", "NO"):
-            side = "NO" if side == "YES" else "YES"
+        # Determine side:
+        # - For classic YES/NO markets, outcome may literally be "Yes"/"No".
+        # - For sports AEC markets, outcome may be a team name (e.g., "DUCKS").
+        #   In that case, interpret netPosition sign as long-side vs short-side.
+        side: str
+        if outcome_upper in ("YES", "Y"):
+            side = "YES"
+        elif outcome_upper in ("NO", "N"):
+            side = "NO"
+        else:
+            side = "YES" if net >= 0 else "NO"
 
         quantity = abs(net)
         current_value = cash_value
@@ -339,7 +342,7 @@ class Position(BaseModel):
 
         normalized: Dict[str, Any] = {
             "marketSlug": slug,
-            "side": side or outcome_upper or "YES",
+            "side": side,
             "quantity": quantity,
             "avgPrice": str(avg_price),
             "currentValue": str(current_value) if current_value is not None else None,

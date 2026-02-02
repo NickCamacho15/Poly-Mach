@@ -345,6 +345,27 @@ class TestDataModels:
         assert position.avg_price == Decimal("0.6")
         assert position.current_value == Decimal("65.00")
         assert position.unrealized_pnl == Decimal("5.00")
+
+    def test_position_model_portfolio_positions_schema_team_outcome_uses_net_sign(self):
+        """Team outcomes (e.g. DUCKS) should still parse; side derives from netPosition sign."""
+        from src.data.models import Position, Side
+
+        data = {
+            "netPosition": "-50",
+            "qtyBought": "50",
+            "qtySold": "0",
+            "cost": {"value": "12.50", "currency": "USD"},
+            "cashValue": {"value": "15.00", "currency": "USD"},
+            "marketMetadata": {"slug": "aec-cbb-ore-ucla-2026-02-02", "outcome": "DUCKS"},
+        }
+
+        position = Position.model_validate(data)
+
+        assert position.market_slug == "aec-cbb-ore-ucla-2026-02-02"
+        assert position.side == Side.NO
+        assert position.quantity == 50
+        assert position.avg_price == Decimal("0.25")
+        assert position.current_value == Decimal("15.00")
     
     def test_balance_model(self):
         """Test Balance model parsing."""
