@@ -438,6 +438,11 @@ impl PolymarketClient {
             .cloned()
             .unwrap_or_default();
 
+        // Log the first raw market to see ALL available API fields.
+        if let Some(first) = markets.first() {
+            tracing::info!(raw = %first, "Raw listing market (all fields)");
+        }
+
         // Parse each market individually; skip any that fail deserialization.
         let parsed: Vec<Market> = markets
             .into_iter()
@@ -469,6 +474,11 @@ impl PolymarketClient {
     pub async fn get_market_raw(&self, market_slug: &str) -> Result<serde_json::Value, ApiError> {
         let path = format!("/v1/market/{}", market_slug);
         self.request(reqwest::Method::GET, &path, None, None).await
+    }
+
+    /// Raw GET request for endpoint probing/debugging.
+    pub async fn request_raw(&self, path: &str) -> Result<serde_json::Value, ApiError> {
+        self.request(reqwest::Method::GET, path, None, None).await
     }
 
     /// Get order book for a market.

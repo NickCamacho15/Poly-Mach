@@ -155,26 +155,26 @@ async fn main() -> anyhow::Result<()> {
             info!("  ... and {} more", slugs.len() - 10);
         }
 
-        // Diagnostic: probe one market to see all available API fields.
+        // Diagnostic: try multiple endpoint patterns to find the right one.
         if let Some(first_slug) = slugs.first() {
-            info!(slug = %first_slug, "Probing single market detail (raw)...");
-            match client.get_market_raw(first_slug).await {
-                Ok(raw) => info!(slug = %first_slug, raw = %raw, "Raw market detail"),
-                Err(e) => warn!(slug = %first_slug, error = %e, "Single market detail FAILED"),
-            }
-
-            // Try the /sides endpoint.
-            info!(slug = %first_slug, "Probing order book /sides...");
-            match client.get_market_sides(first_slug).await {
-                Ok(book) => info!(
-                    slug = %first_slug,
-                    yes_bids = book.yes.bids.len(),
-                    yes_asks = book.yes.asks.len(),
-                    no_bids = book.no.bids.len(),
-                    no_asks = book.no.asks.len(),
-                    "Order book /sides OK"
-                ),
-                Err(e) => warn!(slug = %first_slug, error = %e, "Order book /sides FAILED"),
+            // Try various paths to find which one works.
+            let paths_to_try = [
+                format!("/v1/market/{}", first_slug),
+                format!("/v1/markets/{}", first_slug),
+                format!("/v1/market/{}/sides", first_slug),
+                format!("/v1/markets/{}/sides", first_slug),
+                format!("/v1/markets/{}/book", first_slug),
+                format!("/v1/market/{}/book", first_slug),
+                format!("/v1/markets/{}/orderbook", first_slug),
+            ];
+            for path in &paths_to_try {
+                match client.request_raw(path).await {
+                    Ok(data) => {
+                        let preview = format!("{}", data).chars().take(300).collect::<String>();
+                        info!(path = %path, response = %preview, "Endpoint OK");
+                    }
+                    Err(e) => info!(path = %path, error = %e, "Endpoint failed"),
+                }
             }
         }
 

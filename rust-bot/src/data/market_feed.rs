@@ -258,8 +258,10 @@ impl MarketFeed {
             );
         }
 
-        // Staleness check: warn about markets that haven't been updated recently.
-        self.check_staleness();
+        // Staleness check (only every 12 cycles / ~60s to avoid log spam).
+        if cycle % 12 == 0 {
+            self.check_staleness();
+        }
     }
 
     // =========================================================================
