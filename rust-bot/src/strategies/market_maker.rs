@@ -4,10 +4,12 @@
 //! capturing the spread when both sides fill. Includes inventory management,
 //! maker-only enforcement, and stop-loss exits.
 
+#![allow(dead_code)]
+
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::data::models::{Signal, SignalAction, Urgency};
 use crate::state::state_manager::{MarketState, PositionState};

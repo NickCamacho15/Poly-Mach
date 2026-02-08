@@ -5,8 +5,10 @@
 //! - Exposure monitoring (per-market / portfolio / correlation)
 //! - Circuit breaker (daily loss / drawdown / emergency stop)
 
+#![allow(dead_code)]
+
 use rust_decimal::Decimal;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::data::models::Signal;
 use crate::state::state_manager::StateManager;

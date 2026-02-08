@@ -5,10 +5,12 @@
 //! isn't, the problem is execution quality (slippage, latency). If paper
 //! trading also loses money, the strategy itself is broken.
 
+#![allow(dead_code)]
+
 use rust_decimal::Decimal;
 use chrono::Utc;
 use std::collections::HashMap;
-use tracing::{info, warn, debug};
+use tracing::{info, debug};
 
 use crate::data::models::*;
 use crate::data::orderbook::OrderBookTracker;

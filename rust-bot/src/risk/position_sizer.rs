@@ -12,6 +12,8 @@
 //! - Confidence multiplier in [0, 1]
 //! - Clamp to [0, max_position_pct]
 
+#![allow(dead_code)]
+
 use rust_decimal::Decimal;
 use tracing::debug;
 

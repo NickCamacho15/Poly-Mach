@@ -3,6 +3,8 @@
 //! Loads settings from environment variables and .env file.
 //! Faithfully ports Python `src/config.py`.
 
+#![allow(dead_code)]
+
 use rust_decimal::Decimal;
 use std::str::FromStr;
 

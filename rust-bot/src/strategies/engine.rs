@@ -1,13 +1,13 @@
 //! Strategy engine: aggregates signals from all strategies, applies risk
 //! management, and routes approved signals to the execution engine.
 
-use rust_decimal::Decimal;
-use std::collections::HashMap;
-use tracing::{debug, info, warn};
+#![allow(dead_code)]
 
-use crate::data::models::{Signal, SignalAction, Urgency};
+use tracing::debug;
+
+use crate::data::models::Signal;
 use crate::risk::risk_manager::RiskManager;
-use crate::state::state_manager::{MarketState, PositionState, StateManager};
+use crate::state::state_manager::{MarketState, StateManager};
 
 use super::live_arbitrage::{GameState, LiveArbitrageStrategy};
 use super::market_maker::MarketMakerStrategy;

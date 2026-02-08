@@ -3,6 +3,8 @@
 //! Provides a centralized view of the bot's current state, updated by
 //! the data pipeline and execution engine.
 
+#![allow(dead_code)]
+
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use std::collections::HashMap;

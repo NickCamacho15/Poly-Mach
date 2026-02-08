@@ -3,6 +3,8 @@
 //! These models provide type safety and serialization for API responses
 //! and internal data structures. Faithfully ported from Python `src/data/models.py`.
 
+#![allow(dead_code)]
+
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};

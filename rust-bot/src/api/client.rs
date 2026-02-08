@@ -12,6 +12,8 @@
 //! - GET /v1/markets/{slug}/book  — full order book
 //! - GET /v1/markets/{slug}/bbo   — best bid/offer (lightweight)
 
+#![allow(dead_code)]
+
 use governor::{Quota, RateLimiter};
 use reqwest::Client;
 use rust_decimal::Decimal;

@@ -1,5 +1,7 @@
 //! API error types for Polymarket US client.
 
+#![allow(dead_code)]
+
 use thiserror::Error;
 
 #[derive(Error, Debug)]

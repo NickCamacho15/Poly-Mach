@@ -73,16 +73,6 @@ impl MarketFeed {
         }
     }
 
-    /// Create with default configuration.
-    pub fn with_defaults(
-        client: Arc<PolymarketClient>,
-        orderbook: OrderBookTracker,
-        state: StateManager,
-        shutdown: Arc<Notify>,
-    ) -> Self {
-        Self::new(client, orderbook, state, MarketFeedConfig::default(), shutdown)
-    }
-
     /// Run the feed loop. This consumes `self` and runs until the shutdown
     /// signal fires. Intended to be spawned as a background tokio task:
     ///
@@ -294,24 +284,3 @@ impl MarketFeed {
 // Convenience: standalone run function
 // =============================================================================
 
-/// Convenience function to start the market feed as a background task.
-/// Returns a `JoinHandle` that resolves when the feed stops.
-///
-/// # Example
-///
-/// ```ignore
-/// let handle = run_market_feed(client, ob, state, config, shutdown);
-/// // ... later ...
-/// shutdown.notify_waiters();
-/// handle.await.unwrap();
-/// ```
-pub fn run_market_feed(
-    client: Arc<PolymarketClient>,
-    orderbook: OrderBookTracker,
-    state: StateManager,
-    config: MarketFeedConfig,
-    shutdown: Arc<Notify>,
-) -> tokio::task::JoinHandle<()> {
-    let feed = MarketFeed::new(client, orderbook, state, config, shutdown);
-    feed.spawn()
-}

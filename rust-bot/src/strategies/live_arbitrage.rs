@@ -3,10 +3,11 @@
 //! Generates signals on score changes and game events, capturing
 //! mispricing from stale market prices during live games.
 
+#![allow(dead_code)]
+
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
-use tracing::info;
 
 use crate::data::models::{Signal, SignalAction, Urgency};
 use crate::state::state_manager::MarketState;

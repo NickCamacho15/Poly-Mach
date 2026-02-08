@@ -3,6 +3,8 @@
 //! Generates signals when sportsbook implied probabilities diverge
 //! significantly from Polymarket contract prices.
 
+#![allow(dead_code)]
+
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use std::collections::HashMap;

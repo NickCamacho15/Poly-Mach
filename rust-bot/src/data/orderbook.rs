@@ -3,6 +3,8 @@
 //! Maintains a local copy of order books for all tracked markets,
 //! providing sub-microsecond access to best bid/ask prices.
 
+#![allow(dead_code)]
+
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
