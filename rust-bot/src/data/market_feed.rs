@@ -159,7 +159,7 @@ impl MarketFeed {
                     Err(_) => return (slug_owned, Err("Semaphore closed".to_string())),
                 };
 
-                match client.get_market_sides(&slug_owned).await {
+                match client.get_market_book(&slug_owned).await {
                     Ok(book) => (slug_owned, Ok(book)),
                     Err(e) => (slug_owned, Err(e.to_string())),
                 }

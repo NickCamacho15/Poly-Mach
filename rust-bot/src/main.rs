@@ -155,26 +155,22 @@ async fn main() -> anyhow::Result<()> {
             info!("  ... and {} more", slugs.len() - 10);
         }
 
-        // Diagnostic: try multiple endpoint patterns to find the right one.
+        // Quick verification: fetch one order book to confirm endpoints work.
         if let Some(first_slug) = slugs.first() {
-            // Try various paths to find which one works.
-            let paths_to_try = [
-                format!("/v1/market/{}", first_slug),
-                format!("/v1/markets/{}", first_slug),
-                format!("/v1/market/{}/sides", first_slug),
-                format!("/v1/markets/{}/sides", first_slug),
-                format!("/v1/markets/{}/book", first_slug),
-                format!("/v1/market/{}/book", first_slug),
-                format!("/v1/markets/{}/orderbook", first_slug),
-            ];
-            for path in &paths_to_try {
-                match client.request_raw(path).await {
-                    Ok(data) => {
-                        let preview = format!("{}", data).chars().take(300).collect::<String>();
-                        info!(path = %path, response = %preview, "Endpoint OK");
-                    }
-                    Err(e) => info!(path = %path, error = %e, "Endpoint failed"),
+            match client.get_market_book(first_slug).await {
+                Ok(book) => {
+                    let yes_bids = book.yes.bids.len();
+                    let yes_asks = book.yes.asks.len();
+                    info!(
+                        slug = %first_slug,
+                        yes_bids,
+                        yes_asks,
+                        yes_best_bid = ?book.yes.best_bid(),
+                        yes_best_ask = ?book.yes.best_ask(),
+                        "Order book probe OK"
+                    );
                 }
+                Err(e) => warn!(slug = %first_slug, error = %e, "Order book probe failed"),
             }
         }
 

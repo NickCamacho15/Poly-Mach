@@ -6,7 +6,11 @@
 //! - Automatic retries with exponential backoff
 //! - Typed responses
 //!
-//! Ported from Python `src/api/client.py`.
+//! Endpoint paths match the official Polymarket US API documentation:
+//! - GET /v1/markets              — list markets
+//! - GET /v1/market/slug/{slug}   — market detail by slug
+//! - GET /v1/markets/{slug}/book  — full order book
+//! - GET /v1/markets/{slug}/bbo   — best bid/offer (lightweight)
 
 use governor::{Quota, RateLimiter};
 use reqwest::Client;
@@ -18,7 +22,7 @@ use tracing::{debug, warn};
 
 use crate::auth::PolymarketAuth;
 use crate::data::models::*;
-use crate::data::orderbook::parse_book_side;
+use crate::data::orderbook::parse_book_response;
 
 use super::errors::ApiError;
 
@@ -72,24 +76,17 @@ impl PolymarketClient {
         method: reqwest::Method,
         path: &str,
         body: Option<&serde_json::Value>,
-        params: Option<&[(&str, &str)],>,
+        params: Option<&[(&str, &str)]>,
     ) -> Result<serde_json::Value, ApiError> {
         let url = format!("{}{}", self.base_url, path);
         let mut last_error: Option<ApiError> = None;
 
         for attempt in 0..self.max_retries {
-            // Rate limiting
             self.rate_limiter.until_ready().await;
 
-            // Generate fresh auth headers for each attempt
             let auth_headers = self.auth.sign_request(method.as_str(), path);
 
-            debug!(
-                method = %method,
-                path = %path,
-                attempt = attempt + 1,
-                "API request"
-            );
+            debug!(method = %method, path = %path, attempt = attempt + 1, "API request");
 
             let mut req = self
                 .client
@@ -99,7 +96,6 @@ impl PolymarketClient {
             if let Some(body) = body {
                 req = req.json(body);
             }
-
             if let Some(params) = params {
                 req = req.query(params);
             }
@@ -120,7 +116,6 @@ impl PolymarketClient {
                         return Ok(json);
                     }
 
-                    // Rate limit — always retry
                     if status.as_u16() == 429 {
                         let retry_after = response
                             .headers()
@@ -134,15 +129,9 @@ impl PolymarketClient {
                         continue;
                     }
 
-                    // Server errors — retry with backoff
                     if status.as_u16() >= 500 {
-                        let delay_ms = (500 * 2u64.pow(attempt)) as u64;
-                        warn!(
-                            status_code = status.as_u16(),
-                            delay_ms,
-                            attempt = attempt + 1,
-                            "Server error, retrying"
-                        );
+                        let delay_ms = 500 * 2u64.pow(attempt);
+                        warn!(status_code = status.as_u16(), delay_ms, attempt = attempt + 1, "Server error, retrying");
                         tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                         last_error = Some(ApiError::Http {
                             status_code: status.as_u16(),
@@ -152,20 +141,13 @@ impl PolymarketClient {
                         continue;
                     }
 
-                    // Client errors — don't retry
                     let body_text = response.text().await.unwrap_or_default();
                     return Err(ApiError::from_response(status.as_u16(), &body_text));
                 }
                 Err(e) => {
-                    let delay_ms = (500 * 2u64.pow(attempt)) as u64;
-                    warn!(
-                        error = %e,
-                        delay_ms,
-                        attempt = attempt + 1,
-                        "Network error, retrying"
-                    );
+                    let delay_ms = 500 * 2u64.pow(attempt);
+                    warn!(error = %e, delay_ms, attempt = attempt + 1, "Network error, retrying");
                     tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-
                     if e.is_timeout() {
                         last_error = Some(ApiError::Timeout(e.to_string()));
                     } else {
@@ -186,15 +168,12 @@ impl PolymarketClient {
     // Account Endpoints
     // =========================================================================
 
-    /// Get account balance.
     pub async fn get_balance(&self) -> Result<Balance, ApiError> {
         let data = self
             .request(reqwest::Method::GET, "/v1/account/balances", None, None)
             .await?;
 
-        // Handle array format: {"balances": [...]}
         if let Some(balances) = data.get("balances").and_then(|v| v.as_array()) {
-            // Prefer USD entry.
             let entry = balances
                 .iter()
                 .find(|b| {
@@ -211,7 +190,6 @@ impl PolymarketClient {
             }
         }
 
-        // Fallback: flat object.
         serde_json::from_value(data).map_err(|e| ApiError::Deserialization(e.to_string()))
     }
 
@@ -219,13 +197,11 @@ impl PolymarketClient {
     // Portfolio Endpoints
     // =========================================================================
 
-    /// Get all current positions.
     pub async fn get_positions(&self) -> Result<Vec<Position>, ApiError> {
         let data = self
             .request(reqwest::Method::GET, "/v1/portfolio/positions", None, None)
             .await?;
 
-        // Try multiple schemas (matching Python's resilient parsing).
         let raw = data
             .get("positions")
             .or_else(|| data.get("data").and_then(|d| d.get("positions")))
@@ -234,10 +210,7 @@ impl PolymarketClient {
 
         let entries = match raw {
             Some(serde_json::Value::Array(arr)) => arr.clone(),
-            Some(serde_json::Value::Object(map)) => {
-                // Map format: {slug -> position}
-                map.values().cloned().collect()
-            }
+            Some(serde_json::Value::Object(map)) => map.values().cloned().collect(),
             _ => {
                 warn!("Could not parse positions response");
                 return Ok(Vec::new());
@@ -246,7 +219,6 @@ impl PolymarketClient {
 
         let mut positions = Vec::new();
         for entry in entries {
-            // Handle nested {"position": {...}} wrapper.
             let pos_val = entry
                 .get("position")
                 .filter(|v| v.is_object())
@@ -254,9 +226,7 @@ impl PolymarketClient {
 
             match serde_json::from_value::<Position>(pos_val.clone()) {
                 Ok(pos) => positions.push(pos),
-                Err(e) => {
-                    warn!(error = %e, "Failed to parse position");
-                }
+                Err(e) => warn!(error = %e, "Failed to parse position"),
             }
         }
 
@@ -267,41 +237,30 @@ impl PolymarketClient {
     // Order Endpoints
     // =========================================================================
 
-    /// Create a new order.
     pub async fn create_order(&self, order: &OrderRequest) -> Result<CreateOrderResponse, ApiError> {
         let body = serde_json::to_value(order)
             .map_err(|e| ApiError::Deserialization(e.to_string()))?;
-
         let data = self
             .request(reqwest::Method::POST, "/v1/orders", Some(&body), None)
             .await?;
-
         serde_json::from_value(data).map_err(|e| ApiError::Deserialization(e.to_string()))
     }
 
-    /// Preview an order before submitting.
     pub async fn preview_order(&self, order: &OrderRequest) -> Result<OrderPreview, ApiError> {
         let body = serde_json::to_value(order)
             .map_err(|e| ApiError::Deserialization(e.to_string()))?;
-
         let data = self
             .request(reqwest::Method::POST, "/v1/order/preview", Some(&body), None)
             .await?;
-
         let preview_val = data.get("estimatedFill").unwrap_or(&data);
         serde_json::from_value(preview_val.clone())
             .map_err(|e| ApiError::Deserialization(e.to_string()))
     }
 
-    /// Get all open orders.
-    pub async fn get_open_orders(
-        &self,
-        market_slug: Option<&str>,
-    ) -> Result<Vec<Order>, ApiError> {
+    pub async fn get_open_orders(&self, market_slug: Option<&str>) -> Result<Vec<Order>, ApiError> {
         let params: Vec<(&str, &str)> = market_slug
             .map(|s| vec![("marketSlug", s)])
             .unwrap_or_default();
-
         let data = self
             .request(
                 reqwest::Method::GET,
@@ -310,42 +269,33 @@ impl PolymarketClient {
                 if params.is_empty() { None } else { Some(&params) },
             )
             .await?;
-
         let orders = data
             .get("orders")
             .and_then(|v| v.as_array())
             .cloned()
             .unwrap_or_default();
-
         orders
             .into_iter()
             .map(|o| serde_json::from_value(o).map_err(|e| ApiError::Deserialization(e.to_string())))
             .collect()
     }
 
-    /// Get order details by ID.
     pub async fn get_order(&self, order_id: &str) -> Result<Order, ApiError> {
         let path = format!("/v1/order/{}", order_id);
         let data = self.request(reqwest::Method::GET, &path, None, None).await?;
         serde_json::from_value(data).map_err(|e| ApiError::Deserialization(e.to_string()))
     }
 
-    /// Cancel a specific order.
     pub async fn cancel_order(&self, order_id: &str) -> Result<Order, ApiError> {
         let path = format!("/v1/order/{}/cancel", order_id);
         let data = self.request(reqwest::Method::POST, &path, None, None).await?;
         serde_json::from_value(data).map_err(|e| ApiError::Deserialization(e.to_string()))
     }
 
-    /// Cancel all open orders.
-    pub async fn cancel_all_orders(
-        &self,
-        market_slug: Option<&str>,
-    ) -> Result<serde_json::Value, ApiError> {
+    pub async fn cancel_all_orders(&self, market_slug: Option<&str>) -> Result<serde_json::Value, ApiError> {
         let params: Vec<(&str, &str)> = market_slug
             .map(|s| vec![("marketSlug", s)])
             .unwrap_or_default();
-
         self.request(
             reqwest::Method::POST,
             "/v1/orders/open/cancel",
@@ -355,50 +305,30 @@ impl PolymarketClient {
         .await
     }
 
-    /// Modify an existing order.
-    pub async fn modify_order(
-        &self,
-        order_id: &str,
-        price: Option<Decimal>,
-        quantity: Option<i64>,
-    ) -> Result<Order, ApiError> {
+    pub async fn modify_order(&self, order_id: &str, price: Option<Decimal>, quantity: Option<i64>) -> Result<Order, ApiError> {
         let mut payload = serde_json::Map::new();
         if let Some(p) = price {
-            payload.insert(
-                "price".to_string(),
-                serde_json::json!({"value": p.to_string(), "currency": "USD"}),
-            );
+            payload.insert("price".to_string(), serde_json::json!({"value": p.to_string(), "currency": "USD"}));
         }
         if let Some(q) = quantity {
             payload.insert("quantity".to_string(), serde_json::json!(q));
         }
-
         let path = format!("/v1/order/{}/modify", order_id);
         let body = serde_json::Value::Object(payload);
         let data = self.request(reqwest::Method::POST, &path, Some(&body), None).await?;
         serde_json::from_value(data).map_err(|e| ApiError::Deserialization(e.to_string()))
     }
 
-    /// Close entire position in a market.
     pub async fn close_position(&self, market_slug: &str) -> Result<serde_json::Value, ApiError> {
         let body = serde_json::json!({"marketSlug": market_slug});
-        self.request(
-            reqwest::Method::POST,
-            "/v1/order/close-position",
-            Some(&body),
-            None,
-        )
-        .await
+        self.request(reqwest::Method::POST, "/v1/order/close-position", Some(&body), None).await
     }
 
     // =========================================================================
     // Market Endpoints
     // =========================================================================
 
-    /// Get list of available markets.
-    ///
-    /// Pass `closed: Some("false")` to only get open (non-closed) markets,
-    /// matching the Python bot's `discover_markets()` behavior.
+    /// Get list of available markets with optional filters.
     pub async fn get_markets(
         &self,
         status: Option<&str>,
@@ -415,7 +345,7 @@ impl PolymarketClient {
             params.push(("status", s.to_string()));
         }
         if let Some(c) = category {
-            params.push(("category", c.to_string()));
+            params.push(("categories", c.to_string()));
         }
         if let Some(cl) = closed {
             params.push(("closed", cl.to_string()));
@@ -424,12 +354,7 @@ impl PolymarketClient {
         let param_refs: Vec<(&str, &str)> = params.iter().map(|(k, v)| (*k, v.as_str())).collect();
 
         let data = self
-            .request(
-                reqwest::Method::GET,
-                "/v1/markets",
-                None,
-                Some(&param_refs),
-            )
+            .request(reqwest::Method::GET, "/v1/markets", None, Some(&param_refs))
             .await?;
 
         let markets = data
@@ -438,22 +363,13 @@ impl PolymarketClient {
             .cloned()
             .unwrap_or_default();
 
-        // Log the first raw market to see ALL available API fields.
-        if let Some(first) = markets.first() {
-            tracing::info!(raw = %first, "Raw listing market (all fields)");
-        }
-
-        // Parse each market individually; skip any that fail deserialization.
         let parsed: Vec<Market> = markets
             .into_iter()
             .filter_map(|m| {
                 match serde_json::from_value::<Market>(m.clone()) {
                     Ok(market) => Some(market),
                     Err(e) => {
-                        tracing::debug!(
-                            error = %e,
-                            "Skipping unparseable market"
-                        );
+                        tracing::debug!(error = %e, "Skipping unparseable market");
                         None
                     }
                 }
@@ -463,46 +379,42 @@ impl PolymarketClient {
         Ok(parsed)
     }
 
-    /// Get market details by slug.
+    /// Get market details by slug: `GET /v1/market/slug/{slug}`
     pub async fn get_market(&self, market_slug: &str) -> Result<Market, ApiError> {
-        let path = format!("/v1/market/{}", market_slug);
+        let path = format!("/v1/market/slug/{}", market_slug);
         let data = self.request(reqwest::Method::GET, &path, None, None).await?;
         serde_json::from_value(data).map_err(|e| ApiError::Deserialization(e.to_string()))
     }
 
-    /// Get raw (untyped) market details for debugging.
-    pub async fn get_market_raw(&self, market_slug: &str) -> Result<serde_json::Value, ApiError> {
-        let path = format!("/v1/market/{}", market_slug);
-        self.request(reqwest::Method::GET, &path, None, None).await
-    }
-
-    /// Raw GET request for endpoint probing/debugging.
-    pub async fn request_raw(&self, path: &str) -> Result<serde_json::Value, ApiError> {
-        self.request(reqwest::Method::GET, path, None, None).await
-    }
-
-    /// Get order book for a market.
-    pub async fn get_market_sides(&self, market_slug: &str) -> Result<OrderBook, ApiError> {
-        let path = format!("/v1/market/{}/sides", market_slug);
+    /// Get full order book: `GET /v1/markets/{slug}/book`
+    ///
+    /// Returns bids/offers with nested price objects:
+    /// `{ "px": { "value": "0.55", "currency": "USD" }, "qty": "1000" }`
+    pub async fn get_market_book(&self, market_slug: &str) -> Result<OrderBook, ApiError> {
+        let path = format!("/v1/markets/{}/book", market_slug);
         let data = self.request(reqwest::Method::GET, &path, None, None).await?;
+        let market_data = data.get("marketData").unwrap_or(&data);
+        Ok(parse_book_response(market_slug, market_data))
+    }
 
-        let yes_side = data
-            .get("yes")
-            .map(|v| parse_book_side(v))
-            .unwrap_or_default();
-        let no_side = data
-            .get("no")
-            .map(|v| parse_book_side(v))
-            .unwrap_or_default();
+    /// Get best bid/offer (lightweight): `GET /v1/markets/{slug}/bbo`
+    pub async fn get_market_bbo(&self, market_slug: &str) -> Result<BboResponse, ApiError> {
+        let path = format!("/v1/markets/{}/bbo", market_slug);
+        let data = self.request(reqwest::Method::GET, &path, None, None).await?;
+        let lite = data.get("marketDataLite").unwrap_or(&data);
 
-        Ok(OrderBook {
-            market_slug: data
-                .get("marketSlug")
+        fn parse_amount(val: &serde_json::Value) -> Option<Decimal> {
+            val.get("value")
                 .and_then(|v| v.as_str())
-                .unwrap_or(market_slug)
-                .to_string(),
-            yes: yes_side,
-            no: no_side,
+                .and_then(|s| s.parse::<Decimal>().ok())
+        }
+
+        Ok(BboResponse {
+            market_slug: lite.get("marketSlug").and_then(|v| v.as_str()).unwrap_or(market_slug).to_string(),
+            best_bid: lite.get("bestBid").and_then(parse_amount),
+            best_ask: lite.get("bestAsk").and_then(parse_amount),
+            last_trade_price: lite.get("lastTradePx").and_then(parse_amount),
+            current_price: lite.get("currentPx").and_then(parse_amount),
         })
     }
 }

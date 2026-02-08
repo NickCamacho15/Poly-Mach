@@ -167,35 +167,71 @@ pub struct CompletenessArbSignal {
     pub net_margin: Decimal,
 }
 
-/// Parse order book side from API response.
-pub fn parse_book_side(data: &serde_json::Value) -> OrderBookSide {
-    let bids = data
-        .get("bids")
-        .and_then(|v| v.as_array())
+/// Parse a `/v1/markets/{slug}/book` response into an OrderBook.
+///
+/// The API returns a single book with `bids` and `offers` (not YES/NO sides).
+/// Each entry has: `{ "px": { "value": "0.55", "currency": "USD" }, "qty": "1000" }`
+///
+/// For a binary market:
+/// - `bids` = YES buy orders
+/// - `offers` = YES sell orders (= NO buy orders)
+/// - NO prices are derived: NO ask = 1 - YES bid, NO bid = 1 - YES ask
+pub fn parse_book_response(market_slug: &str, market_data: &serde_json::Value) -> OrderBook {
+    let slug = market_data
+        .get("marketSlug")
+        .and_then(|v| v.as_str())
+        .unwrap_or(market_slug)
+        .to_string();
+
+    // Parse bids → YES bids
+    let yes_bids = parse_book_entries(market_data.get("bids"));
+
+    // Parse offers → YES asks
+    let yes_asks = parse_book_entries(market_data.get("offers"));
+
+    // Derive NO side from YES: NO ask = 1 - YES bid, NO bid = 1 - YES ask
+    let no_bids: Vec<PriceLevel> = yes_asks
+        .iter()
+        .map(|level| PriceLevel {
+            price: Decimal::ONE - level.price,
+            quantity: level.quantity,
+        })
+        .collect();
+
+    let no_asks: Vec<PriceLevel> = yes_bids
+        .iter()
+        .map(|level| PriceLevel {
+            price: Decimal::ONE - level.price,
+            quantity: level.quantity,
+        })
+        .collect();
+
+    OrderBook {
+        market_slug: slug,
+        yes: OrderBookSide { bids: yes_bids, asks: yes_asks },
+        no: OrderBookSide { bids: no_bids, asks: no_asks },
+    }
+}
+
+/// Parse book entries from the `/book` response format.
+/// Each entry: `{ "px": { "value": "0.55", "currency": "USD" }, "qty": "1000" }`
+fn parse_book_entries(data: Option<&serde_json::Value>) -> Vec<PriceLevel> {
+    data.and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
-                .filter_map(|p| {
-                    let price = p.get("price")?.as_str()?.parse::<Decimal>().ok()?;
-                    let quantity = p.get("quantity")?.as_i64()?;
+                .filter_map(|entry| {
+                    let price = entry
+                        .get("px")
+                        .and_then(|px| px.get("value"))
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| s.parse::<Decimal>().ok())?;
+                    let quantity = entry
+                        .get("qty")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| s.parse::<i64>().ok())?;
                     Some(PriceLevel { price, quantity })
                 })
                 .collect()
         })
-        .unwrap_or_default();
-
-    let asks = data
-        .get("asks")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|p| {
-                    let price = p.get("price")?.as_str()?.parse::<Decimal>().ok()?;
-                    let quantity = p.get("quantity")?.as_i64()?;
-                    Some(PriceLevel { price, quantity })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    OrderBookSide { bids, asks }
+        .unwrap_or_default()
 }

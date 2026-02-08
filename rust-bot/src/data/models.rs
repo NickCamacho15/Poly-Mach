@@ -231,6 +231,16 @@ impl Market {
     }
 }
 
+/// Lightweight best-bid/offer response from `/v1/markets/{slug}/bbo`.
+#[derive(Debug, Clone)]
+pub struct BboResponse {
+    pub market_slug: String,
+    pub best_bid: Option<Decimal>,
+    pub best_ask: Option<Decimal>,
+    pub last_trade_price: Option<Decimal>,
+    pub current_price: Option<Decimal>,
+}
+
 // =============================================================================
 // Order Models
 // =============================================================================
