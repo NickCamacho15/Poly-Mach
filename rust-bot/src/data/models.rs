@@ -187,15 +187,15 @@ pub struct Market {
     pub category: Option<String>,
     #[serde(alias = "resolutionDate")]
     pub resolution_date: Option<DateTime<Utc>>,
-    #[serde(alias = "yesBid")]
+    #[serde(alias = "yesBid", alias = "bestBid")]
     pub yes_bid: Option<Decimal>,
-    #[serde(alias = "yesAsk")]
+    #[serde(alias = "yesAsk", alias = "bestAsk")]
     pub yes_ask: Option<Decimal>,
-    #[serde(alias = "noBid")]
+    #[serde(alias = "noBid", alias = "bestNoBid")]
     pub no_bid: Option<Decimal>,
-    #[serde(alias = "noAsk")]
+    #[serde(alias = "noAsk", alias = "bestNoAsk")]
     pub no_ask: Option<Decimal>,
-    #[serde(alias = "volume24h")]
+    #[serde(alias = "volume24h", alias = "volume")]
     pub volume_24h: Option<Decimal>,
     /// Whether the market is active (API field).
     #[serde(default)]
