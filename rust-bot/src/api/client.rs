@@ -431,6 +431,11 @@ impl PolymarketClient {
             .cloned()
             .unwrap_or_default();
 
+        // Log first raw market for debugging API structure.
+        if let Some(first) = markets.first() {
+            tracing::info!(raw_sample = %first, "First raw market from API");
+        }
+
         // Parse each market individually; skip any that fail deserialization
         // (API response may include fields/formats we don't expect).
         let parsed: Vec<Market> = markets

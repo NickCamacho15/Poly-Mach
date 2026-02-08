@@ -116,6 +116,19 @@ async fn main() -> anyhow::Result<()> {
         }
         info!(total_fetched = all_markets.len(), "Fetched markets from API");
 
+        // Debug: log first 3 markets to see raw field values.
+        for (i, m) in all_markets.iter().enumerate().take(3) {
+            info!(
+                idx = i,
+                slug = %m.slug,
+                title = %m.title,
+                active = m.active,
+                closed = m.closed,
+                status = ?m.status,
+                "DEBUG raw market"
+            );
+        }
+
         // Filter: active && !closed && game date in the future.
         let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let tradeable: Vec<&data::models::Market> = all_markets
