@@ -36,6 +36,7 @@ dotenvy = "0.15"
 
 # Async utilities
 tokio-util = "0.7"
+futures = "0.3"
 
 # Error handling
 thiserror = "2"
