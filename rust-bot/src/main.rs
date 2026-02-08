@@ -307,12 +307,20 @@ async fn discover_markets(
 
     info!("No MARKET_SLUGS configured, discovering open markets from API...");
 
+    let max_markets = settings.rest_orderbook_max_markets;
     let mut all_slugs = Vec::new();
     let mut offset = 0u32;
     let limit = 50u32;
 
-    // Paginate through open markets.
+    // Paginate through open markets (capped by rest_orderbook_max_markets).
     loop {
+        if all_slugs.len() >= max_markets {
+            info!(
+                max_markets = max_markets,
+                "Reached max market limit — stopping discovery"
+            );
+            break;
+        }
         match client.get_markets(Some("OPEN"), None, limit, offset).await {
             Ok(markets) => {
                 if markets.is_empty() {
@@ -320,6 +328,9 @@ async fn discover_markets(
                 }
                 let batch_count = markets.len();
                 for m in &markets {
+                    if all_slugs.len() >= max_markets {
+                        break;
+                    }
                     // Filter by configured market types if set.
                     let slug_match = settings.market_types.is_empty()
                         || settings.market_types.iter().any(|t| m.slug.starts_with(t));
