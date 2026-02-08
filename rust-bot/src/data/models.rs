@@ -182,24 +182,37 @@ pub struct OrderBook {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Market {
     pub slug: String,
-    #[serde(default, alias = "name")]
+    #[serde(default, alias = "name", alias = "question")]
     pub title: String,
     pub description: Option<String>,
     #[serde(default)]
     pub status: MarketStatus,
     pub category: Option<String>,
+    #[serde(default)]
+    pub active: bool,
+    #[serde(default)]
+    pub closed: bool,
     #[serde(default, alias = "resolutionDate")]
     pub resolution_date: Option<DateTime<Utc>>,
-    #[serde(default, alias = "yesBid")]
+    #[serde(default, alias = "yesBid", alias = "bestBid")]
     pub yes_bid: Option<Decimal>,
-    #[serde(default, alias = "yesAsk")]
+    #[serde(default, alias = "yesAsk", alias = "bestAsk")]
     pub yes_ask: Option<Decimal>,
     #[serde(default, alias = "noBid")]
     pub no_bid: Option<Decimal>,
     #[serde(default, alias = "noAsk")]
     pub no_ask: Option<Decimal>,
-    #[serde(default, alias = "volume24h")]
+    #[serde(default, alias = "volume24h", alias = "volume")]
     pub volume_24h: Option<Decimal>,
+    #[serde(default)]
+    pub liquidity: Option<Decimal>,
+}
+
+impl Market {
+    /// Whether this market is tradeable (active and not closed).
+    pub fn is_tradeable(&self) -> bool {
+        self.active && !self.closed
+    }
 }
 
 impl Market {

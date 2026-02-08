@@ -97,32 +97,62 @@ async fn main() -> anyhow::Result<()> {
     // =========================================================================
     let market_slugs = if settings.market_slugs.is_empty() {
         info!("No MARKET_SLUGS configured, discovering active markets from API...");
-        // Try several status filter values since API format may vary.
-        let discover_result = client.get_markets(Some("OPEN"), None, 50, 0).await;
-        let discover_result = if discover_result.as_ref().map_or(true, |v| v.is_empty()) {
-            // Fallback: try without status filter.
-            info!("Retrying market discovery without status filter...");
-            client.get_markets(None, None, 50, 0).await
-        } else {
-            discover_result
-        };
-        match discover_result {
-            Ok(markets) => {
-                let slugs: Vec<String> = markets.iter().map(|m| m.slug.clone()).collect();
-                info!(count = slugs.len(), "Discovered active markets");
-                for (i, slug) in slugs.iter().enumerate().take(10) {
-                    info!(idx = i, slug = %slug, "  Market");
+        // Fetch a large batch; we'll filter client-side for active, non-closed,
+        // and future-dated markets.
+        let mut all_markets = Vec::new();
+        for offset in (0..200).step_by(50) {
+            match client.get_markets(None, None, 50, offset).await {
+                Ok(batch) => {
+                    if batch.is_empty() {
+                        break;
+                    }
+                    all_markets.extend(batch);
                 }
-                if slugs.len() > 10 {
-                    info!("  ... and {} more", slugs.len() - 10);
+                Err(e) => {
+                    warn!(error = %e, offset, "Market fetch failed at offset");
+                    break;
                 }
-                slugs
-            }
-            Err(e) => {
-                warn!(error = %e, "Failed to discover markets, continuing with empty list");
-                vec![]
             }
         }
+        info!(total_fetched = all_markets.len(), "Fetched markets from API");
+
+        // Filter: active && !closed && game date in the future.
+        let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let tradeable: Vec<&data::models::Market> = all_markets
+            .iter()
+            .filter(|m| m.is_tradeable())
+            .filter(|m| {
+                // Extract date from slug: aec-nfl-lac-ten-YYYY-MM-DD
+                let parts: Vec<&str> = m.slug.split('-').collect();
+                if parts.len() >= 7 {
+                    let date_str = format!("{}-{}-{}", parts[4], parts[5], parts[6]);
+                    date_str >= today
+                } else {
+                    // Keep markets with unknown date format.
+                    true
+                }
+            })
+            .collect();
+
+        let slugs: Vec<String> = tradeable.iter().map(|m| m.slug.clone()).collect();
+        info!(
+            total = all_markets.len(),
+            active = tradeable.len(),
+            "Filtered to tradeable future markets"
+        );
+        for (i, m) in tradeable.iter().enumerate().take(15) {
+            info!(
+                idx = i,
+                slug = %m.slug,
+                title = %m.title,
+                active = m.active,
+                "  Market"
+            );
+        }
+        if slugs.len() > 15 {
+            info!("  ... and {} more", slugs.len() - 15);
+        }
+        slugs
     } else {
         info!(count = settings.market_slugs.len(), "Using configured MARKET_SLUGS");
         settings.market_slugs.clone()
