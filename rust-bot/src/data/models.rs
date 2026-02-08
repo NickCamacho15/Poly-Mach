@@ -197,6 +197,12 @@ pub struct Market {
     pub no_ask: Option<Decimal>,
     #[serde(alias = "volume24h")]
     pub volume_24h: Option<Decimal>,
+    /// Whether the market is active (API field).
+    #[serde(default)]
+    pub active: bool,
+    /// Whether the market is closed (API field).
+    #[serde(default)]
+    pub closed: bool,
 }
 
 fn default_market_status() -> MarketStatus {

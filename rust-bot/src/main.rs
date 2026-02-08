@@ -25,6 +25,7 @@ use std::time::Duration;
 use tokio::signal;
 use tokio::sync::Notify;
 use tracing::{error, info, warn};
+use chrono::Utc;
 
 use auth::PolymarketAuth;
 use config::{Settings, TradingMode};
@@ -291,6 +292,54 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Parse a trailing YYYY-MM-DD date from a market slug.
+/// Returns None if the slug doesn't end with a date.
+fn parse_slug_date(slug: &str) -> Option<chrono::NaiveDate> {
+    // Slug format: aec-nba-lal-bos-2026-01-27
+    // Date is the last 10 characters: YYYY-MM-DD
+    let parts: Vec<&str> = slug.split('-').collect();
+    if parts.len() >= 3 {
+        // Try the last 3 parts as YYYY-MM-DD
+        let n = parts.len();
+        if let (Ok(y), Ok(m), Ok(d)) = (
+            parts[n - 3].parse::<i32>(),
+            parts[n - 2].parse::<u32>(),
+            parts[n - 1].parse::<u32>(),
+        ) {
+            if (2020..=2030).contains(&y) && (1..=12).contains(&m) && (1..=31).contains(&d) {
+                return chrono::NaiveDate::from_ymd_opt(y, m, d);
+            }
+        }
+    }
+    None
+}
+
+/// Check if a market slug is for a current/future event (not past).
+fn is_tradeable_slug(slug: &str) -> bool {
+    match parse_slug_date(slug) {
+        Some(slug_date) => {
+            let today = Utc::now().date_naive();
+            slug_date >= today
+        }
+        // No date in slug → allow (non-sports or unknown format)
+        None => true,
+    }
+}
+
+/// Check if a slug matches configured leagues.
+fn slug_matches_league(slug: &str, leagues: &[String]) -> bool {
+    if leagues.is_empty() {
+        return true;
+    }
+    let parts: Vec<&str> = slug.split('-').collect();
+    if parts.len() >= 2 {
+        let slug_league = parts[1].to_lowercase();
+        leagues.iter().any(|l| l.to_lowercase() == slug_league)
+    } else {
+        false
+    }
+}
+
 /// Discover tradeable markets from the API.
 async fn discover_markets(
     client: &api::client::PolymarketClient,
@@ -308,41 +357,78 @@ async fn discover_markets(
     info!("No MARKET_SLUGS configured, discovering open markets from API...");
 
     let max_markets = settings.rest_orderbook_max_markets;
-    let mut all_slugs = Vec::new();
+    let mut candidate_slugs = Vec::new();
     let mut offset = 0u32;
-    let limit = 50u32;
+    let limit = 100u32; // Fetch more per page since we'll filter aggressively
+    let mut total_fetched = 0u32;
+    let mut filtered_date = 0u32;
+    let mut filtered_closed = 0u32;
+    let mut filtered_type = 0u32;
+    let mut filtered_league = 0u32;
 
-    // Paginate through open markets (capped by rest_orderbook_max_markets).
+    // Paginate through open markets.
     loop {
-        if all_slugs.len() >= max_markets {
+        if candidate_slugs.len() >= max_markets {
             info!(
                 max_markets = max_markets,
                 "Reached max market limit — stopping discovery"
             );
             break;
         }
-        match client.get_markets(Some("OPEN"), None, limit, offset).await {
+        match client.get_markets(None, None, limit, offset).await {
             Ok(markets) => {
                 if markets.is_empty() {
+                    info!("No more markets returned — end of list");
                     break;
                 }
                 let batch_count = markets.len();
+                total_fetched += batch_count as u32;
+
                 for m in &markets {
-                    if all_slugs.len() >= max_markets {
+                    if candidate_slugs.len() >= max_markets {
                         break;
                     }
-                    // Filter by configured market types if set.
-                    let slug_match = settings.market_types.is_empty()
-                        || settings.market_types.iter().any(|t| m.slug.starts_with(t));
-                    if slug_match {
-                        all_slugs.push(m.slug.clone());
+
+                    // Filter: skip closed markets.
+                    if m.closed {
+                        filtered_closed += 1;
+                        continue;
                     }
+
+                    // Filter: market type prefix (aec, asc, tsc, etc.).
+                    let type_match = settings.market_types.is_empty()
+                        || settings.market_types.iter().any(|t| m.slug.starts_with(t));
+                    if !type_match {
+                        filtered_type += 1;
+                        continue;
+                    }
+
+                    // Filter: league from slug (nba, cbb, nfl, etc.).
+                    if !slug_matches_league(&m.slug, &settings.leagues) {
+                        filtered_league += 1;
+                        continue;
+                    }
+
+                    // Filter: slug date — only current/future events.
+                    if !is_tradeable_slug(&m.slug) {
+                        filtered_date += 1;
+                        continue;
+                    }
+
+                    candidate_slugs.push(m.slug.clone());
                 }
+
                 info!(
-                    total_fetched = all_slugs.len(),
+                    candidates = candidate_slugs.len(),
                     batch = batch_count,
-                    "Fetched open markets from API"
+                    total_fetched = total_fetched,
+                    filtered_date = filtered_date,
+                    filtered_closed = filtered_closed,
+                    filtered_type = filtered_type,
+                    filtered_league = filtered_league,
+                    "Market discovery batch"
                 );
+
                 if batch_count < limit as usize {
                     break; // Last page.
                 }
@@ -355,7 +441,67 @@ async fn discover_markets(
         }
     }
 
-    all_slugs
+    info!(
+        candidates = candidate_slugs.len(),
+        total_fetched = total_fetched,
+        filtered_date = filtered_date,
+        filtered_closed = filtered_closed,
+        filtered_type = filtered_type,
+        filtered_league = filtered_league,
+        "Discovery filtering complete"
+    );
+
+    if candidate_slugs.is_empty() {
+        warn!("No candidate markets after filtering — check LEAGUES and MARKET_TYPES settings");
+        return candidate_slugs;
+    }
+
+    // Validate: probe order books for candidate markets to confirm they're live.
+    info!(
+        candidates = candidate_slugs.len(),
+        "Validating candidate markets via order book probes..."
+    );
+    let mut valid_slugs = Vec::new();
+    let mut probe_404 = 0u32;
+    let mut probe_err = 0u32;
+
+    for slug in &candidate_slugs {
+        match client.get_market_sides(slug).await {
+            Ok(book) => {
+                let has_prices = book.yes.best_bid().is_some() || book.yes.best_ask().is_some()
+                    || book.no.best_bid().is_some() || book.no.best_ask().is_some();
+                if has_prices {
+                    valid_slugs.push(slug.clone());
+                } else {
+                    info!(slug = %slug, "Skipping: order book empty");
+                }
+            }
+            Err(e) => {
+                let err_str = e.to_string();
+                if err_str.contains("404") || err_str.contains("Not Found") {
+                    probe_404 += 1;
+                } else {
+                    probe_err += 1;
+                    warn!(slug = %slug, error = %e, "Order book probe error");
+                }
+            }
+        }
+
+        // Stop once we have enough validated markets.
+        if valid_slugs.len() >= max_markets {
+            break;
+        }
+    }
+
+    info!(
+        validated = valid_slugs.len(),
+        candidates = candidate_slugs.len(),
+        probe_404 = probe_404,
+        probe_errors = probe_err,
+        "Market validation complete"
+    );
+
+    valid_slugs
 }
 
 fn init_logging(settings: &Settings) {

@@ -3,7 +3,6 @@
 //! Periodically fetches order books for all tracked markets and updates
 //! the OrderBookTracker and StateManager with fresh top-of-book data.
 
-use rust_decimal::Decimal;
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -75,13 +74,17 @@ impl MarketFeed {
 
         tokio::spawn(async move {
             let interval = Duration::from_millis(config.poll_interval_ms);
+            // Track consecutive failures per slug to remove dead markets.
+            let mut failure_counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+            let max_consecutive_failures: u32 = 3;
+            let mut active_slugs: Vec<String> = slugs.clone();
 
             loop {
-                // Poll all markets in batches.
+                // Poll all active markets in batches.
                 let mut tasks = Vec::new();
                 let semaphore = Arc::new(tokio::sync::Semaphore::new(config.max_concurrency));
 
-                for slug in &slugs {
+                for slug in &active_slugs {
                     let client = client.clone();
                     let slug = slug.clone();
                     let sem = semaphore.clone();
@@ -89,11 +92,8 @@ impl MarketFeed {
                     tasks.push(tokio::spawn(async move {
                         let _permit = sem.acquire().await.ok()?;
                         match client.get_market_sides(&slug).await {
-                            Ok(book) => Some((slug, book)),
-                            Err(e) => {
-                                warn!(slug = %slug, error = %e, "Failed to fetch order book");
-                                None
-                            }
+                            Ok(book) => Some((slug, Ok(book))),
+                            Err(e) => Some((slug, Err(e))),
                         }
                     }));
                 }
@@ -101,43 +101,94 @@ impl MarketFeed {
                 // Collect results.
                 let mut updated_count = 0u32;
                 let mut with_prices = 0u32;
+                let mut error_count = 0u32;
+                let mut slugs_to_remove: Vec<String> = Vec::new();
+
                 for task in tasks {
-                    if let Ok(Some((slug, book))) = task.await {
-                        let yes_bid = book.yes.best_bid();
-                        let yes_ask = book.yes.best_ask();
-                        let no_bid = book.no.best_bid();
-                        let no_ask = book.no.best_ask();
+                    if let Ok(Some((slug, result))) = task.await {
+                        match result {
+                            Ok(book) => {
+                                // Reset failure counter on success.
+                                failure_counts.remove(&slug);
 
-                        if yes_bid.is_some() && yes_ask.is_some() {
-                            with_prices += 1;
+                                let yes_bid = book.yes.best_bid();
+                                let yes_ask = book.yes.best_ask();
+                                let no_bid = book.no.best_bid();
+                                let no_ask = book.no.best_ask();
+
+                                if yes_bid.is_some() && yes_ask.is_some() {
+                                    with_prices += 1;
+                                }
+
+                                // Update orderbook tracker.
+                                orderbook.update(book);
+
+                                // Update state manager with top-of-book.
+                                let market = MarketState {
+                                    market_slug: slug.clone(),
+                                    title: slug.clone(),
+                                    yes_bid,
+                                    yes_ask,
+                                    no_bid,
+                                    no_ask,
+                                    last_updated: chrono::Utc::now(),
+                                };
+                                state.update_market(market.clone());
+
+                                // Send update to engine.
+                                let _ = tx.send(MarketUpdate { market }).await;
+                                updated_count += 1;
+                            }
+                            Err(e) => {
+                                error_count += 1;
+                                let count = failure_counts.entry(slug.clone()).or_insert(0);
+                                *count += 1;
+                                if *count >= max_consecutive_failures {
+                                    warn!(
+                                        slug = %slug,
+                                        failures = *count,
+                                        error = %e,
+                                        "Removing dead market after consecutive failures"
+                                    );
+                                    slugs_to_remove.push(slug);
+                                } else {
+                                    debug!(
+                                        slug = %slug,
+                                        failures = *count,
+                                        error = %e,
+                                        "Order book fetch failed"
+                                    );
+                                }
+                            }
                         }
-
-                        // Update orderbook tracker.
-                        orderbook.update(book);
-
-                        // Update state manager with top-of-book.
-                        let market = MarketState {
-                            market_slug: slug.clone(),
-                            title: slug.clone(),
-                            yes_bid,
-                            yes_ask,
-                            no_bid,
-                            no_ask,
-                            last_updated: chrono::Utc::now(),
-                        };
-                        state.update_market(market.clone());
-
-                        // Send update to engine.
-                        let _ = tx.send(MarketUpdate { market }).await;
-                        updated_count += 1;
                     }
+                }
+
+                // Remove dead markets from polling.
+                if !slugs_to_remove.is_empty() {
+                    let remove_set: HashSet<&String> = slugs_to_remove.iter().collect();
+                    active_slugs.retain(|s| !remove_set.contains(s));
+                    for slug in &slugs_to_remove {
+                        failure_counts.remove(slug.as_str());
+                    }
+                    info!(
+                        removed = slugs_to_remove.len(),
+                        remaining = active_slugs.len(),
+                        "Removed dead markets from polling"
+                    );
                 }
 
                 info!(
                     updated = updated_count,
                     with_prices = with_prices,
+                    errors = error_count,
+                    active_markets = active_slugs.len(),
                     "MarketFeed poll cycle complete"
                 );
+
+                if active_slugs.is_empty() {
+                    warn!("No active markets remaining — feed paused");
+                }
 
                 tokio::time::sleep(interval).await;
             }

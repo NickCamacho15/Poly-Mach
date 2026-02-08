@@ -406,6 +406,7 @@ impl PolymarketClient {
         let mut params = vec![
             ("limit", limit.to_string()),
             ("offset", offset.to_string()),
+            ("closed", "false".to_string()),
         ];
         if let Some(s) = status {
             params.push(("status", s.to_string()));
