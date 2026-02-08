@@ -1,0 +1,22 @@
+[Unit]
+Description=Polymarket US Trading Bot (Rust)
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/Poly-Mach/rust-bot
+EnvironmentFile=/home/ubuntu/Poly-Mach/.env
+ExecStart=/home/ubuntu/Poly-Mach/rust-bot/target/release/polymarket-us-bot
+Restart=always
+RestartSec=10
+TimeoutStopSec=30
+StandardOutput=append:/home/ubuntu/Poly-Mach/logs/rust-bot.log
+StandardError=append:/home/ubuntu/Poly-Mach/logs/rust-bot-error.log
+
+# Resource limits
+LimitNOFILE=65535
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target
