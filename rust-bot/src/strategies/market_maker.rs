@@ -52,7 +52,7 @@ impl Default for MarketMakerConfig {
             price_tolerance: Decimal::new(5, 3), // 0.005
             enabled_markets: Vec::new(),
             inventory_skew_factor: Decimal::new(5, 1), // 0.5
-            min_spread_pct: Decimal::new(2, 2),        // 2%
+            min_spread_pct: Decimal::new(1, 3),        // 0.1% (any real spread)
             maker_only: true,
             stop_loss_pct: Decimal::new(15, 2),            // 15%
             aggressive_stop_loss_pct: Decimal::new(10, 2), // 10%
@@ -361,7 +361,7 @@ impl MarketMakerStrategy {
             },
         );
 
-        debug!(
+        info!(
             market_slug = %market.market_slug,
             bid = %bid_price,
             ask = %ask_price,

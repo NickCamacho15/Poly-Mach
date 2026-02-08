@@ -222,12 +222,10 @@ async fn main() -> anyhow::Result<()> {
     let tick_duration = Duration::from_secs_f64(settings.tick_interval_secs);
     let mut tick_count: u64 = 0;
 
-    // Wait for initial market data before trading.
+    // Wait for initial market data to populate order books.
     info!("Waiting 10s for initial market data...");
     tokio::time::sleep(Duration::from_secs(10)).await;
-
-    // Drain any initial updates.
-    while market_rx.try_recv().is_ok() {}
+    info!("Initial data period complete — starting trading");
 
     loop {
         tokio::select! {

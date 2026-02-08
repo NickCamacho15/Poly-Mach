@@ -99,6 +99,8 @@ impl MarketFeed {
                 }
 
                 // Collect results.
+                let mut updated_count = 0u32;
+                let mut with_prices = 0u32;
                 for task in tasks {
                     if let Ok(Some((slug, book))) = task.await {
                         let yes_bid = book.yes.best_bid();
@@ -106,13 +108,17 @@ impl MarketFeed {
                         let no_bid = book.no.best_bid();
                         let no_ask = book.no.best_ask();
 
+                        if yes_bid.is_some() && yes_ask.is_some() {
+                            with_prices += 1;
+                        }
+
                         // Update orderbook tracker.
                         orderbook.update(book);
 
                         // Update state manager with top-of-book.
                         let market = MarketState {
                             market_slug: slug.clone(),
-                            title: slug.clone(), // Title set during discovery.
+                            title: slug.clone(),
                             yes_bid,
                             yes_ask,
                             no_bid,
@@ -123,8 +129,15 @@ impl MarketFeed {
 
                         // Send update to engine.
                         let _ = tx.send(MarketUpdate { market }).await;
+                        updated_count += 1;
                     }
                 }
+
+                debug!(
+                    updated = updated_count,
+                    with_prices = with_prices,
+                    "MarketFeed poll cycle complete"
+                );
 
                 tokio::time::sleep(interval).await;
             }
