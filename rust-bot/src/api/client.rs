@@ -431,10 +431,26 @@ impl PolymarketClient {
             .cloned()
             .unwrap_or_default();
 
-        markets
+        // Parse each market individually; skip any that fail deserialization
+        // (API response may include fields/formats we don't expect).
+        let parsed: Vec<Market> = markets
             .into_iter()
-            .map(|m| serde_json::from_value(m).map_err(|e| ApiError::Deserialization(e.to_string())))
-            .collect()
+            .filter_map(|m| {
+                match serde_json::from_value::<Market>(m.clone()) {
+                    Ok(market) => Some(market),
+                    Err(e) => {
+                        tracing::debug!(
+                            error = %e,
+                            raw = %m,
+                            "Skipping unparseable market"
+                        );
+                        None
+                    }
+                }
+            })
+            .collect();
+
+        Ok(parsed)
     }
 
     /// Get market details by slug.

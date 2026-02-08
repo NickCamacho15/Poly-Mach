@@ -12,12 +12,15 @@ use std::fmt;
 // Enums
 // =============================================================================
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum MarketStatus {
+    #[default]
     Open,
     Closed,
     Resolved,
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -179,21 +182,23 @@ pub struct OrderBook {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Market {
     pub slug: String,
+    #[serde(default, alias = "name")]
     pub title: String,
     pub description: Option<String>,
+    #[serde(default)]
     pub status: MarketStatus,
     pub category: Option<String>,
-    #[serde(alias = "resolutionDate")]
+    #[serde(default, alias = "resolutionDate")]
     pub resolution_date: Option<DateTime<Utc>>,
-    #[serde(alias = "yesBid")]
+    #[serde(default, alias = "yesBid")]
     pub yes_bid: Option<Decimal>,
-    #[serde(alias = "yesAsk")]
+    #[serde(default, alias = "yesAsk")]
     pub yes_ask: Option<Decimal>,
-    #[serde(alias = "noBid")]
+    #[serde(default, alias = "noBid")]
     pub no_bid: Option<Decimal>,
-    #[serde(alias = "noAsk")]
+    #[serde(default, alias = "noAsk")]
     pub no_ask: Option<Decimal>,
-    #[serde(alias = "volume24h")]
+    #[serde(default, alias = "volume24h")]
     pub volume_24h: Option<Decimal>,
 }
 

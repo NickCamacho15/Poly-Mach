@@ -97,7 +97,16 @@ async fn main() -> anyhow::Result<()> {
     // =========================================================================
     let market_slugs = if settings.market_slugs.is_empty() {
         info!("No MARKET_SLUGS configured, discovering active markets from API...");
-        match client.get_markets(Some("active"), None, 50, 0).await {
+        // Try several status filter values since API format may vary.
+        let discover_result = client.get_markets(Some("OPEN"), None, 50, 0).await;
+        let discover_result = if discover_result.as_ref().map_or(true, |v| v.is_empty()) {
+            // Fallback: try without status filter.
+            info!("Retrying market discovery without status filter...");
+            client.get_markets(None, None, 50, 0).await
+        } else {
+            discover_result
+        };
+        match discover_result {
             Ok(markets) => {
                 let slugs: Vec<String> = markets.iter().map(|m| m.slug.clone()).collect();
                 info!(count = slugs.len(), "Discovered active markets");
