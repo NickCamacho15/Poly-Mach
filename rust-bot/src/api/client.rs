@@ -18,7 +18,7 @@ use rust_decimal::Decimal;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::auth::PolymarketAuth;
 use crate::data::models::*;
@@ -393,7 +393,18 @@ impl PolymarketClient {
     pub async fn get_market_book(&self, market_slug: &str) -> Result<OrderBook, ApiError> {
         let path = format!("/v1/markets/{}/book", market_slug);
         let data = self.request(reqwest::Method::GET, &path, None, None).await?;
+
+        // Temporary: log raw response structure at info level to debug parsing.
+        let preview = format!("{}", data).chars().take(500).collect::<String>();
+        info!(market_slug, response = %preview, "Raw book response");
+
+        let keys: Vec<&str> = data.as_object().map(|o| o.keys().map(|k| k.as_str()).collect()).unwrap_or_default();
+        info!(market_slug, ?keys, "Book response top-level keys");
+
         let market_data = data.get("marketData").unwrap_or(&data);
+        let md_keys: Vec<&str> = market_data.as_object().map(|o| o.keys().map(|k| k.as_str()).collect()).unwrap_or_default();
+        info!(market_slug, ?md_keys, "Book marketData keys");
+
         Ok(parse_book_response(market_slug, market_data))
     }
 

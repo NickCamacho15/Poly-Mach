@@ -155,22 +155,34 @@ async fn main() -> anyhow::Result<()> {
             info!("  ... and {} more", slugs.len() - 10);
         }
 
-        // Quick verification: fetch one order book to confirm endpoints work.
-        if let Some(first_slug) = slugs.first() {
-            match client.get_market_book(first_slug).await {
+        // Probe up to 3 markets to verify book endpoint and debug response format.
+        for probe_slug in slugs.iter().take(3) {
+            // Try full book endpoint.
+            match client.get_market_book(probe_slug).await {
                 Ok(book) => {
-                    let yes_bids = book.yes.bids.len();
-                    let yes_asks = book.yes.asks.len();
                     info!(
-                        slug = %first_slug,
-                        yes_bids,
-                        yes_asks,
+                        slug = %probe_slug,
+                        yes_bids = book.yes.bids.len(),
+                        yes_asks = book.yes.asks.len(),
                         yes_best_bid = ?book.yes.best_bid(),
                         yes_best_ask = ?book.yes.best_ask(),
-                        "Order book probe OK"
+                        "Book probe OK"
                     );
                 }
-                Err(e) => warn!(slug = %first_slug, error = %e, "Order book probe failed"),
+                Err(e) => warn!(slug = %probe_slug, error = %e, "Book probe failed"),
+            }
+            // Also try BBO endpoint for comparison.
+            match client.get_market_bbo(probe_slug).await {
+                Ok(bbo) => {
+                    info!(
+                        slug = %probe_slug,
+                        best_bid = ?bbo.best_bid,
+                        best_ask = ?bbo.best_ask,
+                        last_trade = ?bbo.last_trade_price,
+                        "BBO probe OK"
+                    );
+                }
+                Err(e) => warn!(slug = %probe_slug, error = %e, "BBO probe failed"),
             }
         }
 
