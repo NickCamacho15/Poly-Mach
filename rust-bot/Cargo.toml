@@ -47,6 +47,9 @@ governor = "0.8"
 # UUID generation
 uuid = { version = "1", features = ["v4"] }
 
+[dev-dependencies]
+rust_decimal_macros = "1"
+
 [profile.release]
 opt-level = 3
 lto = "fat"
