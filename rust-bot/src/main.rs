@@ -144,12 +144,40 @@ async fn main() -> anyhow::Result<()> {
             info!(
                 slug = %m.slug,
                 title = %m.title,
+                yes_bid = ?m.yes_bid,
+                yes_ask = ?m.yes_ask,
+                no_bid = ?m.no_bid,
+                no_ask = ?m.no_ask,
                 "  [{}] Market", i + 1
             );
         }
         if slugs.len() > 10 {
             info!("  ... and {} more", slugs.len() - 10);
         }
+
+        // Diagnostic: probe one market to see all available API fields.
+        if let Some(first_slug) = slugs.first() {
+            info!(slug = %first_slug, "Probing single market detail (raw)...");
+            match client.get_market_raw(first_slug).await {
+                Ok(raw) => info!(slug = %first_slug, raw = %raw, "Raw market detail"),
+                Err(e) => warn!(slug = %first_slug, error = %e, "Single market detail FAILED"),
+            }
+
+            // Try the /sides endpoint.
+            info!(slug = %first_slug, "Probing order book /sides...");
+            match client.get_market_sides(first_slug).await {
+                Ok(book) => info!(
+                    slug = %first_slug,
+                    yes_bids = book.yes.bids.len(),
+                    yes_asks = book.yes.asks.len(),
+                    no_bids = book.no.bids.len(),
+                    no_asks = book.no.asks.len(),
+                    "Order book /sides OK"
+                ),
+                Err(e) => warn!(slug = %first_slug, error = %e, "Order book /sides FAILED"),
+            }
+        }
+
         slugs
     } else {
         info!(count = settings.market_slugs.len(), "Using configured MARKET_SLUGS");

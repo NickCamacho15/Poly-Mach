@@ -465,6 +465,12 @@ impl PolymarketClient {
         serde_json::from_value(data).map_err(|e| ApiError::Deserialization(e.to_string()))
     }
 
+    /// Get raw (untyped) market details for debugging.
+    pub async fn get_market_raw(&self, market_slug: &str) -> Result<serde_json::Value, ApiError> {
+        let path = format!("/v1/market/{}", market_slug);
+        self.request(reqwest::Method::GET, &path, None, None).await
+    }
+
     /// Get order book for a market.
     pub async fn get_market_sides(&self, market_slug: &str) -> Result<OrderBook, ApiError> {
         let path = format!("/v1/market/{}/sides", market_slug);

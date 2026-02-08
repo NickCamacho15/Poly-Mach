@@ -218,7 +218,13 @@ impl MarketFeed {
                     success_count += 1;
                 }
                 Ok((slug, Err(e))) => {
-                    warn!(market = %slug, error = %e, "Failed to poll order book");
+                    // Log 404s at debug level (matching Python bot behavior).
+                    // These are common for markets without active order books.
+                    if e.contains("404") {
+                        debug!(market = %slug, "Order book not found (404)");
+                    } else {
+                        warn!(market = %slug, error = %e, "Failed to poll order book");
+                    }
                     error_count += 1;
                 }
                 Err(e) => {
@@ -228,12 +234,29 @@ impl MarketFeed {
             }
         }
 
-        debug!(
-            cycle,
-            success = success_count,
-            errors = error_count,
-            "Poll cycle complete"
-        );
+        // Log summary: debug when everything works, info/warn when there are issues.
+        if error_count > 0 && success_count == 0 {
+            warn!(
+                cycle,
+                success = success_count,
+                errors = error_count,
+                "Poll cycle: ALL order books failed"
+            );
+        } else if error_count > 0 {
+            info!(
+                cycle,
+                success = success_count,
+                errors = error_count,
+                "Poll cycle complete (some failures)"
+            );
+        } else {
+            debug!(
+                cycle,
+                success = success_count,
+                errors = error_count,
+                "Poll cycle complete"
+            );
+        }
 
         // Staleness check: warn about markets that haven't been updated recently.
         self.check_staleness();
