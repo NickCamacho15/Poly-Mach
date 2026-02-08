@@ -445,17 +445,29 @@ impl MarketMakerStrategy {
     /// Calculate order quantity based on notional sizing.
     /// Uses order_size (dollars) / price to get contract count,
     /// capped by max_contracts_per_order.
+    /// Ensures notional (qty * price) >= $1.00 so the risk manager's
+    /// min_trade_size check won't silently reject the order.
     fn calculate_quantity(&self, price: Decimal) -> i64 {
         if price <= Decimal::ZERO {
             return 0;
         }
-        let qty = (self.config.order_size / price)
+        let target_qty = (self.config.order_size / price)
             .floor()
             .to_string()
             .parse::<i64>()
             .unwrap_or(0);
-        // Cap at max_contracts_per_order to prevent huge positions on cheap markets.
-        qty.max(1).min(self.config.max_contracts_per_order)
+        // Ensure notional >= $1.00 (min_trade_size default) so risk manager
+        // doesn't reject the order. ceil($1 / price) gives the minimum qty.
+        let min_qty_for_notional = (Decimal::ONE / price)
+            .ceil()
+            .to_string()
+            .parse::<i64>()
+            .unwrap_or(1);
+        // Use the larger of target_qty and min_qty_for_notional, capped.
+        target_qty
+            .max(min_qty_for_notional)
+            .max(1)
+            .min(self.config.max_contracts_per_order)
     }
 
     fn market_spread_pct(&self, market: &MarketState) -> Option<Decimal> {

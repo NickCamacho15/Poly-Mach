@@ -91,7 +91,7 @@ impl MarketFeed {
                         match client.get_market_sides(&slug).await {
                             Ok(book) => Some((slug, book)),
                             Err(e) => {
-                                debug!(slug = %slug, error = %e, "Failed to fetch order book");
+                                warn!(slug = %slug, error = %e, "Failed to fetch order book");
                                 None
                             }
                         }
@@ -133,7 +133,7 @@ impl MarketFeed {
                     }
                 }
 
-                debug!(
+                info!(
                     updated = updated_count,
                     with_prices = with_prices,
                     "MarketFeed poll cycle complete"

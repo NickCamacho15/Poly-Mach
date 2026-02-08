@@ -135,7 +135,7 @@ impl StrategyEngine {
                     approved.push(sig);
                 }
             } else {
-                debug!(reason = %decision.reason, "Signal rejected");
+                warn!(reason = %decision.reason, "Signal rejected by risk manager");
                 rejected += 1;
             }
         }
