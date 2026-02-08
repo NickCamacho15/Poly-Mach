@@ -228,7 +228,8 @@ fn parse_book_entries(data: Option<&serde_json::Value>) -> Vec<PriceLevel> {
                     let quantity = entry
                         .get("qty")
                         .and_then(|v| v.as_str())
-                        .and_then(|s| s.parse::<i64>().ok())?;
+                        .and_then(|s| s.parse::<f64>().ok())
+                        .map(|f| f as i64)?;
                     Some(PriceLevel { price, quantity })
                 })
                 .collect()
