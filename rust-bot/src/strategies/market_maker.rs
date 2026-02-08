@@ -2,7 +2,8 @@
 //!
 //! Two-sided market making: posts bid and ask orders around mid-price,
 //! capturing the spread when both sides fill. Includes inventory management,
-//! maker-only enforcement, and stop-loss exits.
+//! maker-only enforcement, stop-loss exits, and safety guards against
+//! extreme prices and rapid re-entry after stop-loss.
 
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
@@ -29,25 +30,37 @@ pub struct MarketMakerConfig {
     pub stop_loss_pct: Decimal,
     pub aggressive_stop_loss_pct: Decimal,
     pub max_underwater_hold_seconds: i64,
+    /// Minimum YES mid-price to trade (skip penny markets).
+    pub min_mid_price: Decimal,
+    /// Maximum YES mid-price to trade (skip markets near ceiling).
+    pub max_mid_price: Decimal,
+    /// Cooldown in seconds after a stop-loss before re-entering a market.
+    pub stop_loss_cooldown_secs: i64,
+    /// Maximum contracts per order to prevent oversized positions on cheap markets.
+    pub max_contracts_per_order: i64,
 }
 
 impl Default for MarketMakerConfig {
     fn default() -> Self {
         Self {
-            spread: Decimal::new(2, 2),        // 0.02
-            order_size: Decimal::new(10, 0),    // $10
+            spread: Decimal::new(2, 2),         // 0.02
+            order_size: Decimal::new(1, 0),     // $1 notional per side
             max_inventory: Decimal::new(50, 0), // $50
             refresh_interval_secs: 5.0,
-            min_spread: Decimal::new(1, 2),    // 0.01
-            max_spread: Decimal::new(10, 2),   // 0.10
+            min_spread: Decimal::new(1, 2),     // 0.01
+            max_spread: Decimal::new(10, 2),    // 0.10
             price_tolerance: Decimal::new(5, 3), // 0.005
             enabled_markets: Vec::new(),
             inventory_skew_factor: Decimal::new(5, 1), // 0.5
-            min_spread_pct: Decimal::new(2, 2),        // 0.02 = 2%
+            min_spread_pct: Decimal::new(2, 2),        // 2%
             maker_only: true,
-            stop_loss_pct: Decimal::new(5, 2),            // 5%
-            aggressive_stop_loss_pct: Decimal::new(3, 2), // 3%
+            stop_loss_pct: Decimal::new(15, 2),            // 15%
+            aggressive_stop_loss_pct: Decimal::new(10, 2), // 10%
             max_underwater_hold_seconds: 600,              // 10 min
+            min_mid_price: Decimal::new(5, 2),             // 0.05
+            max_mid_price: Decimal::new(95, 2),            // 0.95
+            stop_loss_cooldown_secs: 60,                   // 60 seconds
+            max_contracts_per_order: 50,                   // cap at 50 contracts
         }
     }
 }
@@ -65,6 +78,8 @@ struct QuoteState {
 pub struct MarketMakerStrategy {
     config: MarketMakerConfig,
     quotes: HashMap<String, QuoteState>,
+    /// Tracks when stop-loss was last triggered per market.
+    stop_loss_cooldowns: HashMap<String, DateTime<Utc>>,
     enabled: bool,
 }
 
@@ -79,6 +94,7 @@ impl MarketMakerStrategy {
         Self {
             config,
             quotes: HashMap::new(),
+            stop_loss_cooldowns: HashMap::new(),
             enabled: true,
         }
     }
@@ -103,6 +119,28 @@ impl MarketMakerStrategy {
             return Vec::new();
         }
 
+        // Skip markets where mid-price is too extreme (penny or ceiling).
+        if let Some(mid) = market.yes_mid_price() {
+            if mid < self.config.min_mid_price || mid > self.config.max_mid_price {
+                debug!(
+                    market_slug = %market.market_slug,
+                    mid = %mid,
+                    "Skipping: mid-price outside safe range [{}, {}]",
+                    self.config.min_mid_price, self.config.max_mid_price
+                );
+                return Vec::new();
+            }
+        }
+
+        // Check stop-loss cooldown — don't re-enter if recently stopped out.
+        if self.is_in_cooldown(&market.market_slug) {
+            debug!(
+                market_slug = %market.market_slug,
+                "Skipping: stop-loss cooldown active"
+            );
+            return Vec::new();
+        }
+
         let quote_state = self.get_or_create_quote(&market.market_slug);
         if self.should_refresh(&market, &quote_state) {
             self.generate_quote_signals(market, position)
@@ -113,7 +151,7 @@ impl MarketMakerStrategy {
 
     /// Check positions for stop-loss exits.
     pub fn check_stop_loss(
-        &self,
+        &mut self,
         position: &PositionState,
         market: &MarketState,
     ) -> Vec<Signal> {
@@ -172,6 +210,10 @@ impl MarketMakerStrategy {
                 "Risk exit triggered"
             );
 
+            // Record cooldown to prevent immediate re-entry.
+            self.stop_loss_cooldowns
+                .insert(position.market_slug.clone(), Utc::now());
+
             signals.push(Signal {
                 market_slug: position.market_slug.clone(),
                 action,
@@ -187,6 +229,16 @@ impl MarketMakerStrategy {
         }
 
         signals
+    }
+
+    /// Check if a market is in stop-loss cooldown.
+    fn is_in_cooldown(&self, slug: &str) -> bool {
+        if let Some(cooldown_start) = self.stop_loss_cooldowns.get(slug) {
+            let elapsed = (Utc::now() - *cooldown_start).num_seconds();
+            elapsed < self.config.stop_loss_cooldown_secs
+        } else {
+            false
+        }
     }
 
     /// Generate quote signals (cancel existing + place new).
@@ -208,6 +260,18 @@ impl MarketMakerStrategy {
             Some(prices) => prices,
             None => return signals,
         };
+
+        // Ensure spread is enough to cover fees (at least 20 bps net).
+        let min_profitable_spread = Decimal::new(3, 3); // 0.003
+        if ask_price - bid_price < min_profitable_spread {
+            debug!(
+                market_slug = %market.market_slug,
+                bid = %bid_price,
+                ask = %ask_price,
+                "Skipping: spread too narrow to be profitable after fees"
+            );
+            return signals;
+        }
 
         let bid_qty = self.calculate_quantity(bid_price);
         let ask_qty = self.calculate_quantity(ask_price);
@@ -350,7 +414,7 @@ impl MarketMakerStrategy {
             ask = clamp_price(mid + half_spread);
         }
 
-        // Maker-only enforcement.
+        // Maker-only enforcement: don't cross the book.
         if self.config.maker_only {
             if let Some(yes_bid) = market.yes_bid {
                 bid = bid.min(yes_bid);
@@ -361,26 +425,8 @@ impl MarketMakerStrategy {
             bid = clamp_price(bid);
             ask = clamp_price(ask);
 
+            // If we can't find valid quotes, fall back to book prices.
             if bid >= ask {
-                let m = market.yes_mid_price().unwrap_or(mid);
-                let h = self.config.spread / Decimal::TWO;
-                bid = clamp_price(
-                    m - h
-                        + market
-                            .yes_bid
-                            .map(|b| (m - h).min(b))
-                            .unwrap_or(m - h)
-                        - (m - h),
-                );
-                ask = clamp_price(
-                    m + h
-                        + market
-                            .yes_ask
-                            .map(|a| (m + h).max(a))
-                            .unwrap_or(m + h)
-                        - (m + h),
-                );
-                // Simpler fallback:
                 if let (Some(yb), Some(ya)) = (market.yes_bid, market.yes_ask) {
                     bid = clamp_price(yb);
                     ask = clamp_price(ya);
@@ -388,9 +434,17 @@ impl MarketMakerStrategy {
             }
         }
 
+        // Final check: bid must be strictly less than ask.
+        if bid >= ask {
+            return None;
+        }
+
         Some((bid, ask))
     }
 
+    /// Calculate order quantity based on notional sizing.
+    /// Uses order_size (dollars) / price to get contract count,
+    /// capped by max_contracts_per_order.
     fn calculate_quantity(&self, price: Decimal) -> i64 {
         if price <= Decimal::ZERO {
             return 0;
@@ -400,7 +454,8 @@ impl MarketMakerStrategy {
             .to_string()
             .parse::<i64>()
             .unwrap_or(0);
-        qty.max(1)
+        // Cap at max_contracts_per_order to prevent huge positions on cheap markets.
+        qty.max(1).min(self.config.max_contracts_per_order)
     }
 
     fn market_spread_pct(&self, market: &MarketState) -> Option<Decimal> {

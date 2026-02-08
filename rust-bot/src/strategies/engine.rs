@@ -63,6 +63,9 @@ impl StrategyEngine {
                 let stop_signals = mm.check_stop_loss(pos, market);
                 all_signals.extend(stop_signals);
             }
+
+            // Also scan completeness arbitrage from orderbook tracker.
+            // (Arb signals are handled separately in on_tick.)
         }
 
         // Apply risk management.

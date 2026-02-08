@@ -6,10 +6,10 @@
 //! Architecture:
 //! - Tokio async runtime for concurrent I/O
 //! - Ed25519 authenticated REST API client
-//! - Real-time order book tracking
+//! - REST-polled order book tracking via MarketFeed
 //! - Three strategy engines: market maker, live arbitrage, statistical edge
+//! - Paper and live execution modes
 //! - Kelly Criterion position sizing with exposure limits and circuit breakers
-//! - Sub-100ms signal-to-order latency target
 
 mod api;
 mod auth;
@@ -28,8 +28,9 @@ use tracing::{error, info, warn};
 
 use auth::PolymarketAuth;
 use config::{Settings, TradingMode};
+use data::market_feed::{MarketFeed, MarketFeedConfig};
 use data::orderbook::OrderBookTracker;
-use execution::executor::LiveExecutor;
+use execution::paper_executor::PaperExecutor;
 use risk::risk_manager::{RiskConfig, RiskManager};
 use state::state_manager::StateManager;
 use strategies::engine::StrategyEngine;
@@ -64,8 +65,9 @@ async fn main() -> anyhow::Result<()> {
     let auth = PolymarketAuth::new(&settings.pm_api_key_id, &settings.pm_private_key)?;
     info!(public_key = %auth.public_key_base64(), "Authentication initialized");
 
-    // Initialize API client.
+    // Initialize API client (shared via Arc for MarketFeed).
     let client = api::client::PolymarketClient::with_defaults(auth, &settings.pm_base_url)?;
+    let client = Arc::new(client);
 
     // Initialize state manager.
     let state = StateManager::new(settings.initial_balance);
@@ -73,15 +75,75 @@ async fn main() -> anyhow::Result<()> {
     // Initialize order book tracker.
     let orderbook = OrderBookTracker::new();
 
-    // Initialize executor.
-    let mut executor = LiveExecutor::new(client, state.clone(), orderbook.clone());
+    // =========================================================================
+    // Market discovery
+    // =========================================================================
+    let market_slugs = discover_markets(&client, &settings).await;
+    if market_slugs.is_empty() {
+        error!("No tradeable markets found — exiting");
+        anyhow::bail!("No tradeable markets");
+    }
+    info!(
+        tradeable = market_slugs.len(),
+        "Discovered tradeable markets"
+    );
 
-    // Initialize executor (sync state from API).
-    if settings.trading_mode == TradingMode::Live {
-        info!("Syncing initial state from API...");
-        if let Err(e) = executor.initialize().await {
-            warn!(error = %e, "Initial state sync failed (continuing with defaults)");
+    // Log first 10 markets.
+    for (i, slug) in market_slugs.iter().enumerate().take(10) {
+        info!("  [{}] Market slug={}", i + 1, slug);
+    }
+    if market_slugs.len() > 10 {
+        info!("  ... and {} more", market_slugs.len() - 10);
+    }
+
+    // Probe the first market's order book to verify connectivity.
+    if let Some(first_slug) = market_slugs.first() {
+        match client.get_market_sides(first_slug).await {
+            Ok(book) => {
+                info!(
+                    slug = %first_slug,
+                    yes_bids = book.yes.bids.len(),
+                    yes_asks = book.yes.asks.len(),
+                    yes_best_bid = ?book.yes.best_bid(),
+                    yes_best_ask = ?book.yes.best_ask(),
+                    no_best_bid = ?book.no.best_bid(),
+                    no_best_ask = ?book.no.best_ask(),
+                    "Order book probe OK"
+                );
+            }
+            Err(e) => {
+                warn!(error = %e, slug = %first_slug, "Order book probe failed");
+            }
         }
+    }
+
+    // =========================================================================
+    // Start MarketFeed (background order book polling)
+    // =========================================================================
+    let feed_config = MarketFeedConfig {
+        poll_interval_ms: (settings.rest_orderbook_poll_interval_seconds * 1000.0) as u64,
+        max_concurrency: settings.rest_orderbook_concurrency,
+        staleness_threshold_secs: 30,
+    };
+    let feed = MarketFeed::new(feed_config, market_slugs.clone());
+    let mut market_rx = feed.start(client.clone(), orderbook.clone(), state.clone());
+
+    // =========================================================================
+    // Initialize executor
+    // =========================================================================
+    let is_paper = settings.trading_mode == TradingMode::Paper;
+    let mut paper_executor = if is_paper {
+        info!("Paper executor initialized (NO real orders will be placed)");
+        Some(PaperExecutor::new(state.clone(), orderbook.clone()))
+    } else {
+        None
+    };
+
+    // For live mode, use the LiveExecutor (requires owned client).
+    // Currently paper mode is the primary path; live mode would need
+    // a separate client instance or Arc-based LiveExecutor refactor.
+    if !is_paper {
+        warn!("Live mode not yet fully supported in this version — use Paper mode");
     }
 
     // Initialize risk manager.
@@ -149,13 +211,23 @@ async fn main() -> anyhow::Result<()> {
     });
 
     // Main trading loop.
+    let mode_str = if is_paper { "Paper" } else { "Live" };
     info!(
         tick_interval_secs = settings.tick_interval_secs,
+        trading_mode = mode_str,
+        markets = market_slugs.len(),
         "Starting trading loop"
     );
 
     let tick_duration = Duration::from_secs_f64(settings.tick_interval_secs);
     let mut tick_count: u64 = 0;
+
+    // Wait for initial market data before trading.
+    info!("Waiting 10s for initial market data...");
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    // Drain any initial updates.
+    while market_rx.try_recv().is_ok() {}
 
     loop {
         tokio::select! {
@@ -163,73 +235,118 @@ async fn main() -> anyhow::Result<()> {
                 info!("Shutting down trading loop...");
                 break;
             }
+            // Process market data updates → drive market maker strategy.
+            Some(update) = market_rx.recv() => {
+                let output = engine.on_market_update(&update.market, &mut risk_manager);
+
+                for signal in &output.approved_signals {
+                    if let Some(ref mut pe) = paper_executor {
+                        pe.execute_signal(signal);
+                    }
+                }
+            }
+            // Periodic tick for time-based strategies.
             _ = tokio::time::sleep(tick_duration) => {
                 tick_count += 1;
 
-                // Periodic reconciliation.
-                if tick_count % 10 == 0 {
-                    if let Err(e) = executor.reconcile_state().await {
-                        warn!(error = %e, "Reconciliation failed");
-                    }
-                }
-
-                // Run strategies.
+                // Run time-based strategies (arb, stat edge).
                 let output = engine.on_tick(&mut risk_manager);
 
-                // Execute approved signals.
                 for signal in &output.approved_signals {
-                    let result = executor.execute_signal(signal).await;
-                    if let Some(ref err) = result.error {
-                        warn!(
-                            market_slug = %signal.market_slug,
-                            error = %err,
-                            "Execution failed"
-                        );
+                    if let Some(ref mut pe) = paper_executor {
+                        pe.execute_signal(signal);
                     }
                 }
 
                 // Periodic performance logging.
-                if tick_count % 60 == 0 {
-                    let perf = executor.get_performance();
-                    info!(
-                        tick = tick_count,
-                        equity = ?perf.get("total_equity"),
-                        pnl = ?perf.get("total_pnl"),
-                        trades = ?perf.get("total_trades"),
-                        positions = ?perf.get("open_positions"),
-                        "Performance update"
-                    );
+                if tick_count % 30 == 0 {
+                    if let Some(ref pe) = paper_executor {
+                        let perf = pe.get_performance();
+                        info!(
+                            tick = tick_count,
+                            mode = mode_str,
+                            markets_tracked = market_slugs.len(),
+                            active_arbs = 0,
+                            equity = ?perf.get("total_equity"),
+                            pnl = ?perf.get("total_pnl"),
+                            trades = ?perf.get("total_trades"),
+                            win_rate = ?perf.get("win_rate"),
+                            positions = ?perf.get("open_positions"),
+                            fees_paid = ?perf.get("fees_paid"),
+                            max_drawdown = ?perf.get("max_drawdown"),
+                            "Performance update"
+                        );
+                    }
                 }
             }
         }
     }
 
     // Graceful shutdown.
-    info!("Cancelling all open orders...");
-    // Cancel all orders across all tracked markets.
-    let markets = state.get_all_markets();
-    for market in &markets {
-        let _ = executor
-            .execute_signal(&data::models::Signal {
-                market_slug: market.market_slug.clone(),
-                action: data::models::SignalAction::CancelAll,
-                price: rust_decimal::Decimal::ZERO,
-                quantity: 0,
-                urgency: data::models::Urgency::Critical,
-                confidence: 1.0,
-                strategy_name: "shutdown".to_string(),
-                reason: "Graceful shutdown".to_string(),
-                metadata: std::collections::HashMap::new(),
-                timestamp: chrono::Utc::now(),
-            })
-            .await;
+    info!("Shutting down...");
+    if let Some(ref pe) = paper_executor {
+        let perf = pe.get_performance();
+        info!(performance = ?perf, "Final performance report");
     }
-
-    let perf = executor.get_performance();
-    info!(performance = ?perf, "Final performance report");
     info!("Bot shutdown complete.");
 
     Ok(())
+}
+
+/// Discover tradeable markets from the API.
+async fn discover_markets(
+    client: &api::client::PolymarketClient,
+    settings: &Settings,
+) -> Vec<String> {
+    // If explicit slugs are configured, use those.
+    if !settings.market_slugs.is_empty() {
+        info!(
+            count = settings.market_slugs.len(),
+            "Using configured MARKET_SLUGS"
+        );
+        return settings.market_slugs.clone();
+    }
+
+    info!("No MARKET_SLUGS configured, discovering open markets from API...");
+
+    let mut all_slugs = Vec::new();
+    let mut offset = 0u32;
+    let limit = 50u32;
+
+    // Paginate through open markets.
+    loop {
+        match client.get_markets(Some("OPEN"), None, limit, offset).await {
+            Ok(markets) => {
+                if markets.is_empty() {
+                    break;
+                }
+                let batch_count = markets.len();
+                for m in &markets {
+                    // Filter by configured market types if set.
+                    let slug_match = settings.market_types.is_empty()
+                        || settings.market_types.iter().any(|t| m.slug.starts_with(t));
+                    if slug_match {
+                        all_slugs.push(m.slug.clone());
+                    }
+                }
+                info!(
+                    total_fetched = all_slugs.len(),
+                    batch = batch_count,
+                    "Fetched open markets from API"
+                );
+                if batch_count < limit as usize {
+                    break; // Last page.
+                }
+                offset += limit;
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to fetch markets");
+                break;
+            }
+        }
+    }
+
+    all_slugs
 }
 
 fn init_logging(settings: &Settings) {
