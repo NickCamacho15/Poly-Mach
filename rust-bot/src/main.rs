@@ -456,10 +456,18 @@ async fn discover_markets(
         return candidate_slugs;
     }
 
+    // Log candidate slugs for diagnostics.
+    for (i, slug) in candidate_slugs.iter().enumerate().take(20) {
+        info!("  candidate[{}] {}", i + 1, slug);
+    }
+    if candidate_slugs.len() > 20 {
+        info!("  ... and {} more candidates", candidate_slugs.len() - 20);
+    }
+
     // Validate: probe order books for candidate markets to confirm they're live.
     info!(
         candidates = candidate_slugs.len(),
-        "Validating candidate markets via order book probes..."
+        "Validating candidate markets via order book probes (/v1/markets/{{slug}}/book)..."
     );
     let mut valid_slugs = Vec::new();
     let mut probe_404 = 0u32;

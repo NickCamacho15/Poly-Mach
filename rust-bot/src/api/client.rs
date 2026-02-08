@@ -407,6 +407,7 @@ impl PolymarketClient {
             ("limit", limit.to_string()),
             ("offset", offset.to_string()),
             ("closed", "false".to_string()),
+            ("active", "true".to_string()),
         ];
         if let Some(s) = status {
             params.push(("status", s.to_string()));
@@ -451,14 +452,14 @@ impl PolymarketClient {
 
     /// Get market details by slug.
     pub async fn get_market(&self, market_slug: &str) -> Result<Market, ApiError> {
-        let path = format!("/v1/market/{}", market_slug);
+        let path = format!("/v1/markets/{}", market_slug);
         let data = self.request(reqwest::Method::GET, &path, None, None).await?;
         serde_json::from_value(data).map_err(|e| ApiError::Deserialization(e.to_string()))
     }
 
-    /// Get order book for a market.
+    /// Get order book for a market (full depth).
     pub async fn get_market_sides(&self, market_slug: &str) -> Result<OrderBook, ApiError> {
-        let path = format!("/v1/market/{}/sides", market_slug);
+        let path = format!("/v1/markets/{}/book", market_slug);
         let data = self.request(reqwest::Method::GET, &path, None, None).await?;
 
         let yes_side = data
@@ -473,6 +474,7 @@ impl PolymarketClient {
         Ok(OrderBook {
             market_slug: data
                 .get("marketSlug")
+                .or_else(|| data.get("slug"))
                 .and_then(|v| v.as_str())
                 .unwrap_or(market_slug)
                 .to_string(),
