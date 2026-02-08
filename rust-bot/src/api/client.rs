@@ -425,16 +425,27 @@ impl PolymarketClient {
             )
             .await?;
 
-        let markets = data
+        // Try multiple response shapes: {"markets": [...]}, {"data": [...]}, or bare array.
+        let raw_array = data
             .get("markets")
+            .or_else(|| data.get("data"))
             .and_then(|v| v.as_array())
             .cloned()
+            .or_else(|| data.as_array().cloned())
             .unwrap_or_default();
 
-        markets
-            .into_iter()
-            .map(|m| serde_json::from_value(m).map_err(|e| ApiError::Deserialization(e.to_string())))
-            .collect()
+        // Parse each market, skipping entries that fail to deserialize
+        // (resilient to schema variations across market types).
+        let mut markets = Vec::new();
+        for entry in raw_array {
+            match serde_json::from_value::<Market>(entry) {
+                Ok(m) => markets.push(m),
+                Err(e) => {
+                    debug!("Skipping unparseable market entry: {}", e);
+                }
+            }
+        }
+        Ok(markets)
     }
 
     /// Get market details by slug.

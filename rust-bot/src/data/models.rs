@@ -179,8 +179,10 @@ pub struct OrderBook {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Market {
     pub slug: String,
+    #[serde(alias = "name", alias = "question", default)]
     pub title: String,
     pub description: Option<String>,
+    #[serde(default = "default_market_status")]
     pub status: MarketStatus,
     pub category: Option<String>,
     #[serde(alias = "resolutionDate")]
@@ -195,6 +197,10 @@ pub struct Market {
     pub no_ask: Option<Decimal>,
     #[serde(alias = "volume24h")]
     pub volume_24h: Option<Decimal>,
+}
+
+fn default_market_status() -> MarketStatus {
+    MarketStatus::Open
 }
 
 impl Market {
