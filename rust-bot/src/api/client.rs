@@ -396,12 +396,16 @@ impl PolymarketClient {
     // =========================================================================
 
     /// Get list of available markets.
+    ///
+    /// Pass `closed: Some("false")` to only get open (non-closed) markets,
+    /// matching the Python bot's `discover_markets()` behavior.
     pub async fn get_markets(
         &self,
         status: Option<&str>,
         category: Option<&str>,
         limit: u32,
         offset: u32,
+        closed: Option<&str>,
     ) -> Result<Vec<Market>, ApiError> {
         let mut params = vec![
             ("limit", limit.to_string()),
@@ -412,6 +416,9 @@ impl PolymarketClient {
         }
         if let Some(c) = category {
             params.push(("category", c.to_string()));
+        }
+        if let Some(cl) = closed {
+            params.push(("closed", cl.to_string()));
         }
 
         let param_refs: Vec<(&str, &str)> = params.iter().map(|(k, v)| (*k, v.as_str())).collect();
@@ -431,13 +438,7 @@ impl PolymarketClient {
             .cloned()
             .unwrap_or_default();
 
-        // Log first raw market for debugging API structure.
-        if let Some(first) = markets.first() {
-            tracing::info!(raw_sample = %first, "First raw market from API");
-        }
-
-        // Parse each market individually; skip any that fail deserialization
-        // (API response may include fields/formats we don't expect).
+        // Parse each market individually; skip any that fail deserialization.
         let parsed: Vec<Market> = markets
             .into_iter()
             .filter_map(|m| {
@@ -446,7 +447,6 @@ impl PolymarketClient {
                     Err(e) => {
                         tracing::debug!(
                             error = %e,
-                            raw = %m,
                             "Skipping unparseable market"
                         );
                         None

@@ -96,12 +96,12 @@ async fn main() -> anyhow::Result<()> {
     // Discover markets to trade
     // =========================================================================
     let market_slugs = if settings.market_slugs.is_empty() {
-        info!("No MARKET_SLUGS configured, discovering active markets from API...");
-        // Fetch a large batch; we'll filter client-side for active, non-closed,
-        // and future-dated markets.
+        info!("No MARKET_SLUGS configured, discovering open markets from API...");
+        // Pass closed=false to only get open (non-closed) markets,
+        // matching the Python bot's discover_markets() approach.
         let mut all_markets = Vec::new();
-        for offset in (0..200).step_by(50) {
-            match client.get_markets(None, None, 50, offset).await {
+        for offset in (0..500).step_by(100) {
+            match client.get_markets(None, None, 100, offset, Some("false")).await {
                 Ok(batch) => {
                     if batch.is_empty() {
                         break;
@@ -114,26 +114,13 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        info!(total_fetched = all_markets.len(), "Fetched markets from API");
+        info!(total_fetched = all_markets.len(), "Fetched open markets from API");
 
-        // Debug: log first 3 markets to see raw field values.
-        for (i, m) in all_markets.iter().enumerate().take(3) {
-            info!(
-                idx = i,
-                slug = %m.slug,
-                title = %m.title,
-                active = m.active,
-                closed = m.closed,
-                status = ?m.status,
-                "DEBUG raw market"
-            );
-        }
-
-        // Filter: active && !closed && game date in the future.
+        // Additional client-side filter: active, future game date.
         let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let tradeable: Vec<&data::models::Market> = all_markets
             .iter()
-            .filter(|m| m.is_tradeable())
+            .filter(|m| m.active)
             .filter(|m| {
                 // Extract date from slug: aec-nfl-lac-ten-YYYY-MM-DD
                 let parts: Vec<&str> = m.slug.split('-').collect();
@@ -149,21 +136,19 @@ async fn main() -> anyhow::Result<()> {
 
         let slugs: Vec<String> = tradeable.iter().map(|m| m.slug.clone()).collect();
         info!(
-            total = all_markets.len(),
-            active = tradeable.len(),
-            "Filtered to tradeable future markets"
+            total_fetched = all_markets.len(),
+            tradeable = tradeable.len(),
+            "Discovered tradeable markets"
         );
-        for (i, m) in tradeable.iter().enumerate().take(15) {
+        for (i, m) in tradeable.iter().enumerate().take(10) {
             info!(
-                idx = i,
                 slug = %m.slug,
                 title = %m.title,
-                active = m.active,
-                "  Market"
+                "  [{}] Market", i + 1
             );
         }
-        if slugs.len() > 15 {
-            info!("  ... and {} more", slugs.len() - 15);
+        if slugs.len() > 10 {
+            info!("  ... and {} more", slugs.len() - 10);
         }
         slugs
     } else {
