@@ -73,6 +73,24 @@ impl StrategyEngine {
     pub fn on_tick(&mut self, risk_manager: &mut RiskManager) -> EngineOutput {
         let mut all_signals = Vec::new();
 
+        // Market maker: iterate all tracked markets and generate quotes.
+        if self.market_maker.is_some() {
+            let markets = self.state.get_all_markets();
+            for market in &markets {
+                let position = self.state.get_position(&market.market_slug);
+                if let Some(ref mut mm) = self.market_maker {
+                    let mm_signals = mm.on_market_update(market, position.as_ref());
+                    all_signals.extend(mm_signals);
+
+                    // Check stop-loss for existing positions.
+                    if let Some(ref pos) = position {
+                        let stop_signals = mm.check_stop_loss(pos, market);
+                        all_signals.extend(stop_signals);
+                    }
+                }
+            }
+        }
+
         // Live arbitrage tick.
         if let Some(ref mut la) = self.live_arbitrage {
             let state_ref = &self.state;
