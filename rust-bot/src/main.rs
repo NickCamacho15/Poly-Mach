@@ -464,49 +464,61 @@ async fn discover_markets(
         info!("  ... and {} more candidates", candidate_slugs.len() - 20);
     }
 
-    // Validate: probe order books for candidate markets to confirm they're live.
-    info!(
-        candidates = candidate_slugs.len(),
-        "Validating candidate markets via order book probes (/v1/markets/{{slug}}/book)..."
-    );
+    // Validate: probe a sample of order books to check API connectivity.
+    // Accept all candidates that the API says are active — order books may be
+    // empty now but will fill as game time approaches. The MarketFeed will
+    // keep polling and pick up data when it arrives.
     let mut valid_slugs = Vec::new();
-    let mut probe_404 = 0u32;
+    let mut with_prices = 0u32;
+    let mut empty_books = 0u32;
     let mut probe_err = 0u32;
 
-    for slug in &candidate_slugs {
-        match client.get_market_sides(slug).await {
-            Ok(book) => {
-                let has_prices = book.yes.best_bid().is_some() || book.yes.best_ask().is_some()
-                    || book.no.best_bid().is_some() || book.no.best_ask().is_some();
-                if has_prices {
+    // Probe first few to verify the endpoint works, then accept the rest.
+    let probe_count = candidate_slugs.len().min(5);
+    for (i, slug) in candidate_slugs.iter().enumerate() {
+        if i < probe_count {
+            match client.get_market_sides(slug).await {
+                Ok(book) => {
+                    let has_prices = book.yes.best_bid().is_some() || book.yes.best_ask().is_some()
+                        || book.no.best_bid().is_some() || book.no.best_ask().is_some();
+                    if has_prices {
+                        with_prices += 1;
+                    } else {
+                        empty_books += 1;
+                    }
                     valid_slugs.push(slug.clone());
-                } else {
-                    info!(slug = %slug, "Skipping: order book empty");
+                }
+                Err(e) => {
+                    let err_str = e.to_string();
+                    if err_str.contains("404") || err_str.contains("Not Found") {
+                        // 404 means market isn't tradeable yet — skip it.
+                        info!(slug = %slug, "Skipping: 404 on order book");
+                    } else {
+                        probe_err += 1;
+                        warn!(slug = %slug, error = %e, "Order book probe error");
+                        // Still accept — might be a transient error.
+                        valid_slugs.push(slug.clone());
+                    }
                 }
             }
-            Err(e) => {
-                let err_str = e.to_string();
-                if err_str.contains("404") || err_str.contains("Not Found") {
-                    probe_404 += 1;
-                } else {
-                    probe_err += 1;
-                    warn!(slug = %slug, error = %e, "Order book probe error");
-                }
-            }
+        } else {
+            // Accept remaining candidates without probing (API already
+            // confirmed they're active=true, closed=false).
+            valid_slugs.push(slug.clone());
         }
 
-        // Stop once we have enough validated markets.
         if valid_slugs.len() >= max_markets {
             break;
         }
     }
 
     info!(
-        validated = valid_slugs.len(),
-        candidates = candidate_slugs.len(),
-        probe_404 = probe_404,
+        accepted = valid_slugs.len(),
+        probed = probe_count,
+        with_prices = with_prices,
+        empty_books = empty_books,
         probe_errors = probe_err,
-        "Market validation complete"
+        "Market validation complete (empty books are normal for upcoming games)"
     );
 
     valid_slugs
