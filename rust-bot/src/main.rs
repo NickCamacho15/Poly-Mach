@@ -30,7 +30,9 @@ use tracing::{error, info, warn};
 use auth::PolymarketAuth;
 use config::{Settings, TradingMode};
 use data::market_feed::{MarketFeed, MarketFeedConfig};
+use data::odds_feed::{OddsFeed, OddsFeedConfig};
 use data::orderbook::OrderBookTracker;
+use data::scores_feed::{ScoresFeed, ScoresFeedConfig};
 use execution::executor::LiveExecutor;
 use execution::paper::PaperExecutor;
 use risk::risk_manager::{RiskConfig, RiskManager};
@@ -273,6 +275,49 @@ async fn main() -> anyhow::Result<()> {
     let mut engine = StrategyEngine::new(state.clone(), market_maker, live_arb, stat_edge);
 
     // =========================================================================
+    // Start external data feeds (background tasks)
+    // =========================================================================
+    let (scores_tx, mut scores_rx) =
+        tokio::sync::mpsc::unbounded_channel();
+    let (odds_tx, mut odds_rx) =
+        tokio::sync::mpsc::unbounded_channel();
+
+    // ESPN live scores → live_arbitrage strategy.
+    if settings.enable_live_arbitrage {
+        let scores_config = ScoresFeedConfig {
+            poll_interval: Duration::from_secs_f64(settings.scores_poll_interval_seconds),
+            leagues: settings.leagues.clone(),
+        };
+        let scores_feed = ScoresFeed::new(
+            state.clone(),
+            scores_config,
+            scores_tx,
+            shutdown_notify.clone(),
+        );
+        scores_feed.spawn();
+        info!("ESPN live scores feed started (for live_arbitrage)");
+    }
+
+    // The Odds API → statistical_edge strategy.
+    if settings.enable_statistical_edge && !settings.odds_api_key.is_empty() {
+        let odds_config = OddsFeedConfig {
+            api_key: settings.odds_api_key.clone(),
+            poll_interval: Duration::from_secs_f64(settings.odds_api_poll_interval_seconds),
+            leagues: settings.leagues.clone(),
+        };
+        let odds_feed = OddsFeed::new(
+            state.clone(),
+            odds_config,
+            odds_tx,
+            shutdown_notify.clone(),
+        );
+        odds_feed.spawn();
+        info!("Odds API feed started (for statistical_edge)");
+    } else if settings.enable_statistical_edge && settings.odds_api_key.is_empty() {
+        warn!("Statistical edge enabled but ODDS_API_KEY not set — strategy will have no data");
+    }
+
+    // =========================================================================
     // Initialize executor (paper or live)
     // =========================================================================
     // We use an enum-like approach to avoid trait objects.
@@ -443,6 +488,14 @@ async fn main() -> anyhow::Result<()> {
                     "[ARB] Completeness arb executed (live)"
                 );
             }
+        }
+
+        // Drain external feed events into strategy engine.
+        while let Ok(game_state) = scores_rx.try_recv() {
+            engine.ingest_game_state(game_state);
+        }
+        while let Ok(odds) = odds_rx.try_recv() {
+            engine.ingest_odds(odds);
         }
 
         // Run strategy engine.

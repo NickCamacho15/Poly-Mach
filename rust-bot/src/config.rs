@@ -76,6 +76,11 @@ pub struct Settings {
     pub log_level: String,
     pub log_json: bool,
 
+    // External data feeds
+    pub odds_api_key: String,
+    pub odds_api_poll_interval_seconds: f64,
+    pub scores_poll_interval_seconds: f64,
+
     // Health check
     pub health_host: String,
     pub health_port: u16,
@@ -160,6 +165,10 @@ impl Settings {
             rest_orderbook_poll_interval_seconds: env_f64("REST_ORDERBOOK_POLL_INTERVAL_SECONDS", 5.0),
             rest_orderbook_max_markets: env_usize("REST_ORDERBOOK_MAX_MARKETS", 50),
             rest_orderbook_concurrency: env_usize("REST_ORDERBOOK_CONCURRENCY", 5),
+
+            odds_api_key: env_str("ODDS_API_KEY", ""),
+            odds_api_poll_interval_seconds: env_f64("ODDS_API_POLL_INTERVAL_SECONDS", 300.0),
+            scores_poll_interval_seconds: env_f64("SCORES_POLL_INTERVAL_SECONDS", 15.0),
 
             log_level: env_str("LOG_LEVEL", "info"),
             log_json: env_bool("LOG_JSON", false),
