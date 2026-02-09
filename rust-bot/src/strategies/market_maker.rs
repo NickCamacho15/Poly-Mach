@@ -121,15 +121,15 @@ impl MarketMakerStrategy {
     ) -> Vec<Signal> {
         let mut signals = Vec::new();
 
+        // For YES: sell at yes_bid. For NO: sell at no_bid.
         let (exit_price, effective_close_price) = match position.side {
             crate::data::models::Side::Yes => {
                 let exit = market.yes_bid;
                 (exit, exit)
             }
             crate::data::models::Side::No => {
-                let exit = market.yes_ask;
-                let effective = exit.map(|p| Decimal::ONE - p);
-                (exit, effective)
+                let exit = market.no_bid;
+                (exit, exit)
             }
         };
 
@@ -157,12 +157,13 @@ impl MarketMakerStrategy {
                 )
             };
 
+            // SellYes closes YES positions, SellNo closes NO positions.
             let (action, price) = match position.side {
                 crate::data::models::Side::Yes => {
                     (SignalAction::SellYes, clamp_price(exit_price))
                 }
                 crate::data::models::Side::No => {
-                    (SignalAction::BuyYes, clamp_price(exit_price))
+                    (SignalAction::SellNo, clamp_price(exit_price))
                 }
             };
 

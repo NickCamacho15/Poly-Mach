@@ -126,7 +126,7 @@ impl Settings {
             max_portfolio_exposure: env_decimal("RISK_MAX_PORTFOLIO_EXPOSURE", Decimal::new(350, 0)),
             max_portfolio_exposure_pct: env_decimal("RISK_MAX_PORTFOLIO_EXPOSURE_PCT", Decimal::new(35, 2)),
             max_daily_loss: env_decimal("RISK_MAX_DAILY_LOSS", Decimal::new(100, 0)),
-            kelly_fraction: env_decimal("RISK_KELLY_FRACTION", Decimal::ONE),
+            kelly_fraction: env_decimal("RISK_KELLY_FRACTION", Decimal::new(25, 2)),
             min_edge: env_decimal("RISK_MIN_EDGE", Decimal::new(2, 2)),
             min_trade_size: env_decimal("RISK_MIN_TRADE_SIZE", Decimal::ONE),
             max_correlated_exposure: env_decimal("RISK_MAX_CORRELATED_EXPOSURE", Decimal::new(2500, 0)),

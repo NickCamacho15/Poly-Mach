@@ -121,17 +121,30 @@ impl StateManager {
         self.inner.write().unwrap().balance = balance;
     }
 
+    /// Total equity using mark-to-market pricing when available.
+    /// Falls back to cost basis if no current market data exists.
     pub fn get_total_equity(&self) -> Decimal {
         let inner = self.inner.read().unwrap();
         let position_value: Decimal = inner
             .positions
             .values()
-            .map(|p| p.cost_basis())
+            .map(|p| mark_to_market(p, &inner.markets))
             .sum();
         inner.balance + position_value
     }
 
+    /// Total position value using mark-to-market pricing when available.
     pub fn get_total_position_value(&self) -> Decimal {
+        let inner = self.inner.read().unwrap();
+        inner
+            .positions
+            .values()
+            .map(|p| mark_to_market(p, &inner.markets))
+            .sum()
+    }
+
+    /// Total position value using cost basis only (no market data needed).
+    pub fn get_cost_basis_value(&self) -> Decimal {
         let inner = self.inner.read().unwrap();
         inner.positions.values().map(|p| p.cost_basis()).sum()
     }
@@ -157,6 +170,8 @@ impl StateManager {
     // Positions
     // =========================================================================
 
+    /// Update or insert a position. Keyed by `market_slug:side` so both
+    /// YES and NO can coexist for the same market (needed for completeness arb).
     pub fn update_position(
         &self,
         market_slug: &str,
@@ -164,13 +179,14 @@ impl StateManager {
         quantity: i64,
         avg_price: Decimal,
     ) {
+        let key = position_key(market_slug, side);
         let mut inner = self.inner.write().unwrap();
         if quantity <= 0 {
-            inner.positions.remove(market_slug);
+            inner.positions.remove(&key);
         } else {
             let entry = inner
                 .positions
-                .entry(market_slug.to_string())
+                .entry(key)
                 .or_insert_with(|| PositionState {
                     market_slug: market_slug.to_string(),
                     side,
@@ -184,8 +200,25 @@ impl StateManager {
         }
     }
 
+    /// Get any position for a market (tries YES first, then NO).
+    /// For side-specific lookups, use `get_position_for_side`.
     pub fn get_position(&self, market_slug: &str) -> Option<PositionState> {
-        self.inner.read().unwrap().positions.get(market_slug).cloned()
+        let inner = self.inner.read().unwrap();
+        inner
+            .positions
+            .get(&position_key(market_slug, Side::Yes))
+            .or_else(|| inner.positions.get(&position_key(market_slug, Side::No)))
+            .cloned()
+    }
+
+    /// Get position for a specific side.
+    pub fn get_position_for_side(
+        &self,
+        market_slug: &str,
+        side: Side,
+    ) -> Option<PositionState> {
+        let key = position_key(market_slug, side);
+        self.inner.read().unwrap().positions.get(&key).cloned()
     }
 
     pub fn get_all_positions(&self) -> Vec<PositionState> {
@@ -198,8 +231,17 @@ impl StateManager {
             .collect()
     }
 
+    /// Remove all positions for a market (both YES and NO sides).
     pub fn remove_position(&self, market_slug: &str) {
-        self.inner.write().unwrap().positions.remove(market_slug);
+        let mut inner = self.inner.write().unwrap();
+        inner.positions.remove(&position_key(market_slug, Side::Yes));
+        inner.positions.remove(&position_key(market_slug, Side::No));
+    }
+
+    /// Remove position for a specific side only.
+    pub fn remove_position_for_side(&self, market_slug: &str, side: Side) {
+        let key = position_key(market_slug, side);
+        self.inner.write().unwrap().positions.remove(&key);
     }
 
     // =========================================================================
@@ -256,14 +298,47 @@ impl StateManager {
         self.inner.read().unwrap().positions.len()
     }
 
-    /// Total exposure for a specific market.
+    /// Total exposure for a specific market (sums both YES and NO sides).
     pub fn market_exposure(&self, market_slug: &str) -> Decimal {
-        self.inner
-            .read()
-            .unwrap()
+        let inner = self.inner.read().unwrap();
+        let yes_exp = inner
             .positions
-            .get(market_slug)
+            .get(&position_key(market_slug, Side::Yes))
             .map(|p| p.cost_basis())
-            .unwrap_or(Decimal::ZERO)
+            .unwrap_or(Decimal::ZERO);
+        let no_exp = inner
+            .positions
+            .get(&position_key(market_slug, Side::No))
+            .map(|p| p.cost_basis())
+            .unwrap_or(Decimal::ZERO);
+        yes_exp + no_exp
     }
+}
+
+// =============================================================================
+// Helpers
+// =============================================================================
+
+/// Position storage key: `"{slug}:YES"` or `"{slug}:NO"`.
+/// Allows both sides to coexist for the same market.
+fn position_key(market_slug: &str, side: Side) -> String {
+    format!("{}:{}", market_slug, side)
+}
+
+/// Mark-to-market valuation: use current bid price if available,
+/// fall back to cost basis.
+fn mark_to_market(
+    position: &PositionState,
+    markets: &HashMap<String, MarketState>,
+) -> Decimal {
+    if let Some(market) = markets.get(&position.market_slug) {
+        let current_price = match position.side {
+            Side::Yes => market.yes_bid,
+            Side::No => market.no_bid,
+        };
+        if let Some(price) = current_price {
+            return price * Decimal::from(position.quantity);
+        }
+    }
+    position.cost_basis()
 }

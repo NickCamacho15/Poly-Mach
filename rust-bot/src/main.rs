@@ -347,17 +347,100 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        // Scan for completeness arbitrage opportunities.
+        // Scan for completeness arbitrage opportunities and EXECUTE them.
         let arb_signals = orderbook.scan_completeness_arb(settings.min_edge);
-        if !arb_signals.is_empty() {
-            for arb in &arb_signals {
+        for arb in &arb_signals {
+            let cost_per_pair = arb.combined_cost;
+            if cost_per_pair <= rust_decimal::Decimal::ZERO {
+                continue;
+            }
+
+            // Budget: smaller of configured order size or 50% of available cash.
+            let available = state.get_balance();
+            let half_cash = available * rust_decimal::Decimal::new(5, 1);
+            let arb_budget = settings.market_maker_order_size.min(half_cash);
+
+            let max_qty = (arb_budget / cost_per_pair)
+                .floor()
+                .to_string()
+                .parse::<i64>()
+                .unwrap_or(0);
+            if max_qty <= 0 {
+                continue;
+            }
+
+            info!(
+                market = %arb.market_slug,
+                yes_ask = %arb.yes_ask,
+                no_ask = %arb.no_ask,
+                combined = %arb.combined_cost,
+                net_margin = %arb.net_margin,
+                qty = max_qty,
+                "Completeness ARB detected — executing"
+            );
+
+            let mut metadata = std::collections::HashMap::new();
+            metadata.insert(
+                "arb_type".to_string(),
+                serde_json::json!("completeness"),
+            );
+            metadata.insert(
+                "net_margin".to_string(),
+                serde_json::json!(arb.net_margin.to_string()),
+            );
+
+            let buy_yes = data::models::Signal {
+                market_slug: arb.market_slug.clone(),
+                action: data::models::SignalAction::BuyYes,
+                price: arb.yes_ask,
+                quantity: max_qty,
+                urgency: data::models::Urgency::Critical,
+                confidence: 0.99,
+                strategy_name: "completeness_arb".to_string(),
+                reason: format!(
+                    "Completeness arb YES leg: {}+{}={}, margin={}",
+                    arb.yes_ask, arb.no_ask, arb.combined_cost, arb.net_margin
+                ),
+                metadata: metadata.clone(),
+                timestamp: chrono::Utc::now(),
+            };
+
+            let buy_no = data::models::Signal {
+                market_slug: arb.market_slug.clone(),
+                action: data::models::SignalAction::BuyNo,
+                price: arb.no_ask,
+                quantity: max_qty,
+                urgency: data::models::Urgency::Critical,
+                confidence: 0.99,
+                strategy_name: "completeness_arb".to_string(),
+                reason: format!(
+                    "Completeness arb NO leg: {}+{}={}, margin={}",
+                    arb.yes_ask, arb.no_ask, arb.combined_cost, arb.net_margin
+                ),
+                metadata,
+                timestamp: chrono::Utc::now(),
+            };
+
+            // Execute both legs (bypass risk manager — guaranteed profit).
+            if let Some(ref mut paper) = paper_executor {
+                let yes_r = paper.execute_signal(&buy_yes);
+                let no_r = paper.execute_signal(&buy_no);
                 info!(
                     market = %arb.market_slug,
-                    yes_ask = %arb.yes_ask,
-                    no_ask = %arb.no_ask,
-                    combined = %arb.combined_cost,
+                    yes_fill = yes_r.filled_quantity,
+                    no_fill = no_r.filled_quantity,
                     net_margin = %arb.net_margin,
-                    "Completeness ARB detected"
+                    "[ARB] Completeness arb executed (paper)"
+                );
+            } else if let Some(ref mut live) = live_executor {
+                let yes_r = live.execute_signal(&buy_yes).await;
+                let no_r = live.execute_signal(&buy_no).await;
+                info!(
+                    market = %arb.market_slug,
+                    yes_fill = yes_r.filled_quantity,
+                    no_fill = no_r.filled_quantity,
+                    net_margin = %arb.net_margin,
+                    "[ARB] Completeness arb executed (live)"
                 );
             }
         }

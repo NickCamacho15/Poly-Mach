@@ -948,7 +948,7 @@ impl PaperExecutor {
             self.state
                 .update_position(market_slug, side, pos.quantity, pos.avg_price);
         } else {
-            self.state.remove_position(market_slug);
+            self.state.remove_position_for_side(market_slug, side);
         }
 
         // Update performance metrics.
