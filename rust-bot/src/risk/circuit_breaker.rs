@@ -3,6 +3,8 @@
 //! Monitors daily loss and drawdown to halt trading when risk thresholds
 //! are exceeded.
 
+#![allow(dead_code)]
+
 use rust_decimal::Decimal;
 use tracing::warn;
 

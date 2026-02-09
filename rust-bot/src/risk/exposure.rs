@@ -1,5 +1,7 @@
 //! Exposure monitoring for position and portfolio limits.
 
+#![allow(dead_code)]
+
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 

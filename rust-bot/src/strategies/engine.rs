@@ -1,13 +1,13 @@
 //! Strategy engine: aggregates signals from all strategies, applies risk
 //! management, and routes approved signals to the execution engine.
 
-use rust_decimal::Decimal;
-use std::collections::HashMap;
-use tracing::{debug, info, warn};
+#![allow(dead_code)]
 
-use crate::data::models::{Signal, SignalAction, Urgency};
+use tracing::debug;
+
+use crate::data::models::Signal;
 use crate::risk::risk_manager::RiskManager;
-use crate::state::state_manager::{MarketState, PositionState, StateManager};
+use crate::state::state_manager::{MarketState, StateManager};
 
 use super::live_arbitrage::{GameState, LiveArbitrageStrategy};
 use super::market_maker::MarketMakerStrategy;
@@ -72,6 +72,24 @@ impl StrategyEngine {
     /// Process a tick (time-based triggers) through all strategies.
     pub fn on_tick(&mut self, risk_manager: &mut RiskManager) -> EngineOutput {
         let mut all_signals = Vec::new();
+
+        // Market maker: iterate all tracked markets and generate quotes.
+        if self.market_maker.is_some() {
+            let markets = self.state.get_all_markets();
+            for market in &markets {
+                let position = self.state.get_position(&market.market_slug);
+                if let Some(ref mut mm) = self.market_maker {
+                    let mm_signals = mm.on_market_update(market, position.as_ref());
+                    all_signals.extend(mm_signals);
+
+                    // Check stop-loss for existing positions.
+                    if let Some(ref pos) = position {
+                        let stop_signals = mm.check_stop_loss(pos, market);
+                        all_signals.extend(stop_signals);
+                    }
+                }
+            }
+        }
 
         // Live arbitrage tick.
         if let Some(ref mut la) = self.live_arbitrage {

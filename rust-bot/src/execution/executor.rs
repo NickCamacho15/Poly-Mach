@@ -3,7 +3,8 @@
 //! Handles order placement, cancellation, and fill tracking.
 //! Supports both paper (simulated) and live trading modes.
 
-use chrono::Utc;
+#![allow(dead_code)]
+
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
