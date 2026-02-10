@@ -118,7 +118,7 @@ async fn main() -> anyhow::Result<()> {
         }
         info!(total_fetched = all_markets.len(), "Fetched open markets from API");
 
-        // Additional client-side filter: active, future game date.
+        // Additional client-side filter: active, TODAY's game date only.
         let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let tradeable: Vec<&data::models::Market> = all_markets
             .iter()
@@ -128,7 +128,7 @@ async fn main() -> anyhow::Result<()> {
                 let parts: Vec<&str> = m.slug.split('-').collect();
                 if parts.len() >= 7 {
                     let date_str = format!("{}-{}-{}", parts[4], parts[5], parts[6]);
-                    date_str >= today
+                    date_str == today
                 } else {
                     // Keep markets with unknown date format.
                     true

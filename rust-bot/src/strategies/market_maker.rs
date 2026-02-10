@@ -200,9 +200,12 @@ impl MarketMakerStrategy {
     ) -> Vec<Signal> {
         let mut signals = Vec::new();
 
-        // Check minimum spread requirement.
+        // Check spread requirements: skip if too tight or too wide.
         let spread_pct = self.market_spread_pct(market);
         if spread_pct.map(|s| s < self.config.min_spread_pct).unwrap_or(true) {
+            return signals;
+        }
+        if spread_pct.map(|s| s > self.config.max_spread).unwrap_or(false) {
             return signals;
         }
 
